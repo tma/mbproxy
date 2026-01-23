@@ -1,0 +1,27 @@
+# Build artifacts
+mbproxy
+*.exe
+
+# Go specific
+vendor/
+*.test
+*.out
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Test artifacts
+coverage.out
+coverage.html
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
