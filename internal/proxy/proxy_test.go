@@ -63,9 +63,9 @@ func TestProxy_HandleWriteReadOnlyMode(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	tests := []struct {
-		name     string
-		mode     config.ReadOnlyMode
-		wantExc  bool // Whether to expect exception response
+		name    string
+		mode    config.ReadOnlyMode
+		wantExc bool // Whether to expect exception response
 	}{
 		{"readonly on", config.ReadOnlyOn, false},
 		{"readonly deny", config.ReadOnlyDeny, true},
@@ -138,9 +138,9 @@ func TestProxy_BuildFakeWriteResponse(t *testing.T) {
 	p := &Proxy{}
 
 	tests := []struct {
-		name     string
-		req      *modbus.Request
-		wantLen  int
+		name    string
+		req     *modbus.Request
+		wantLen int
 	}{
 		{
 			name: "write single coil",

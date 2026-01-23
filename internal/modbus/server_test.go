@@ -210,8 +210,8 @@ func buildMBAPRequest(txID uint16, slaveID byte, funcCode byte, address uint16, 
 	binary.BigEndian.PutUint16(pdu[3:5], quantity)
 
 	frame := make([]byte, 7+len(pdu))
-	binary.BigEndian.PutUint16(frame[0:2], txID)     // Transaction ID
-	binary.BigEndian.PutUint16(frame[2:4], 0)        // Protocol ID (Modbus = 0)
+	binary.BigEndian.PutUint16(frame[0:2], txID)               // Transaction ID
+	binary.BigEndian.PutUint16(frame[2:4], 0)                  // Protocol ID (Modbus = 0)
 	binary.BigEndian.PutUint16(frame[4:6], uint16(len(pdu)+1)) // Length
 	frame[6] = slaveID
 	copy(frame[7:], pdu)
