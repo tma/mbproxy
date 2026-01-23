@@ -35,6 +35,20 @@ docker run --rm -v $(pwd):/app -w /app golang:1.24 go test -v -race ./...
 
 Note: Race detector requires CGO, which is not available in alpine images. The Dockerfile test stage uses the full golang image for this reason.
 
+## CI Checks
+
+Run the full CI suite locally before committing:
+
+```bash
+# Run all CI checks (format, vet, test with race detector)
+docker run --rm -v $(pwd):/app -w /app golang:1.24 sh -c "go fmt ./... && go vet ./... && go test -v -race ./..."
+```
+
+The CI pipeline runs:
+1. **Format check**: `go fmt ./...` followed by `git diff --exit-code` (fails if formatting changes files)
+2. **Vet**: `go vet ./...`
+3. **Test**: `go test -v -race ./...`
+
 ## Code Style
 
 - Run `go fmt` on all code before committing
