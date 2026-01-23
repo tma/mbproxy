@@ -87,14 +87,12 @@ func (p *Proxy) Shutdown(timeout time.Duration) error {
 
 // HandleRequest implements modbus.Handler interface.
 func (p *Proxy) HandleRequest(ctx context.Context, req *modbus.Request) ([]byte, error) {
-	start := time.Now()
-
 	if modbus.IsWriteFunction(req.FunctionCode) {
-		return p.handleWrite(ctx, req, start)
+		return p.handleWrite(ctx, req)
 	}
 
 	if modbus.IsReadFunction(req.FunctionCode) {
-		return p.handleRead(ctx, req, start)
+		return p.handleRead(ctx, req)
 	}
 
 	// Unknown function code
@@ -105,7 +103,7 @@ func (p *Proxy) HandleRequest(ctx context.Context, req *modbus.Request) ([]byte,
 	return modbus.BuildExceptionResponse(req.FunctionCode, modbus.ExcIllegalFunction), nil
 }
 
-func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request, start time.Time) ([]byte, error) {
+func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, error) {
 	key := cache.Key(req.SlaveID, req.FunctionCode, req.Address, req.Quantity)
 
 	// Use GetOrFetch for request coalescing
@@ -117,20 +115,7 @@ func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request, start time.
 			"qty", req.Quantity,
 		)
 
-		resp, err := p.client.Execute(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-
-		p.logger.Debug("upstream read",
-			"slave_id", req.SlaveID,
-			"func", fmt.Sprintf("0x%02X", req.FunctionCode),
-			"addr", req.Address,
-			"qty", req.Quantity,
-			"duration", time.Since(start),
-		)
-
-		return resp, nil
+		return p.client.Execute(ctx, req)
 	})
 
 	if err != nil {
@@ -159,7 +144,7 @@ func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request, start time.
 	return data, nil
 }
 
-func (p *Proxy) handleWrite(ctx context.Context, req *modbus.Request, start time.Time) ([]byte, error) {
+func (p *Proxy) handleWrite(ctx context.Context, req *modbus.Request) ([]byte, error) {
 	switch p.cfg.ReadOnly {
 	case config.ReadOnlyOn:
 		// Silently ignore, return success response
@@ -185,14 +170,6 @@ func (p *Proxy) handleWrite(ctx context.Context, req *modbus.Request, start time
 		if err != nil {
 			return nil, err
 		}
-
-		p.logger.Debug("upstream write",
-			"slave_id", req.SlaveID,
-			"func", fmt.Sprintf("0x%02X", req.FunctionCode),
-			"addr", req.Address,
-			"qty", req.Quantity,
-			"duration", time.Since(start),
-		)
 
 		// Invalidate exact matching cache entries for all read function codes
 		p.invalidateCache(req)

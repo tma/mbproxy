@@ -89,7 +89,8 @@ func (c *Client) Execute(ctx context.Context, req *Request) ([]byte, error) {
 	// Set slave ID
 	c.conn.SlaveID = req.SlaveID
 
-	// Execute request
+	// Execute request and measure time
+	start := time.Now()
 	resp, err := c.executeRequest(ctx, req)
 	if err != nil {
 		// Try reconnect once
@@ -98,15 +99,25 @@ func (c *Client) Execute(ctx context.Context, req *Request) ([]byte, error) {
 			return nil, fmt.Errorf("reconnect failed: %w", reconnErr)
 		}
 		c.conn.SlaveID = req.SlaveID
+		start = time.Now() // Reset timer for retry
 		resp, err = c.executeRequest(ctx, req)
 		if err != nil {
 			return nil, err
 		}
 	}
+	duration := time.Since(start)
+
+	c.logger.Debug("upstream request completed",
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+		"addr", req.Address,
+		"qty", req.Quantity,
+		"duration", duration,
+	)
 
 	// Apply request delay if configured (only after successful requests)
 	if c.requestDelay > 0 {
-		c.logger.Debug("applying request delay", "duration", c.requestDelay)
+		c.logger.Debug("applying request delay", "delay", c.requestDelay)
 		select {
 		case <-time.After(c.requestDelay):
 		case <-ctx.Done():

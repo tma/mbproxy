@@ -193,8 +193,8 @@ func (c *Cache) Set(key string, data []byte, ttl time.Duration) {
 level=INFO msg="starting proxy" listen=:5502 upstream=192.168.1.100:502
 level=DEBUG msg="cache hit" slave_id=1 func=0x03 addr=0 qty=10
 level=DEBUG msg="cache miss" slave_id=1 func=0x03 addr=0 qty=10
-level=DEBUG msg="upstream read" slave_id=1 func=0x03 addr=0 qty=10 duration=15ms
-level=DEBUG msg="applying request delay" duration=100ms
+level=DEBUG msg="upstream request completed" slave_id=1 func=0x03 addr=0 qty=10 duration=15ms
+level=DEBUG msg="applying request delay" delay=100ms
 level=WARN msg="upstream error, serving stale" slave_id=1 error="timeout"
 level=INFO msg="shutting down"
 ```
