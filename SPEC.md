@@ -43,6 +43,8 @@ Many Modbus devices (inverters, meters, battery systems) have limited polling ca
 - Support clients requesting different slave IDs through the proxy
 - Auto-reconnect on connection failure (unlimited retries, no backoff)
 - Request pacing: configurable delay between upstream requests to prevent overwhelming slow devices
+- TCP keep-alive enabled (30s interval) for connection health monitoring
+- Connect delay: optional silent period after establishing connection for device settling
 
 ### 3. In-Memory Cache
 
@@ -102,6 +104,7 @@ Three modes:
 | `MODBUS_READONLY` | Read-only mode | `true` | `false`, `true`, `deny` |
 | `MODBUS_TIMEOUT` | Upstream connection timeout | `10s` | `5s`, `30s` |
 | `MODBUS_REQUEST_DELAY` | Delay after each upstream request | `0` (disabled) | `100ms`, `500ms` |
+| `MODBUS_CONNECT_DELAY` | Silent period after connecting to upstream | `0` (disabled) | `500ms`, `2s` |
 | `MODBUS_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | `30s` | `10s`, `60s` |
 | `LOG_LEVEL` | Log level | `INFO` | `INFO`, `DEBUG` |
 
@@ -195,6 +198,7 @@ level=DEBUG msg="cache hit" slave_id=1 func=0x03 addr=0 qty=10
 level=DEBUG msg="cache miss" slave_id=1 func=0x03 addr=0 qty=10
 level=DEBUG msg="upstream request completed" slave_id=1 func=0x03 addr=0 qty=10 duration=15ms
 level=DEBUG msg="applying request delay" delay=100ms
+level=DEBUG msg="applying connect delay" delay=500ms
 level=WARN msg="upstream error, serving stale" slave_id=1 error="timeout"
 level=INFO msg="shutting down"
 ```

@@ -50,6 +50,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.RequestDelay != 0 {
 		t.Errorf("expected 0 request delay, got %v", cfg.RequestDelay)
 	}
+	if cfg.ConnectDelay != 0 {
+		t.Errorf("expected 0 connect delay, got %v", cfg.ConnectDelay)
+	}
 	if cfg.ShutdownTimeout != 30*time.Second {
 		t.Errorf("expected 30s shutdown timeout, got %v", cfg.ShutdownTimeout)
 	}
@@ -76,6 +79,7 @@ func TestLoad_CustomValues(t *testing.T) {
 	os.Setenv("MODBUS_READONLY", "false")
 	os.Setenv("MODBUS_TIMEOUT", "5s")
 	os.Setenv("MODBUS_REQUEST_DELAY", "100ms")
+	os.Setenv("MODBUS_CONNECT_DELAY", "200ms")
 	os.Setenv("MODBUS_SHUTDOWN_TIMEOUT", "60s")
 	os.Setenv("LOG_LEVEL", "DEBUG")
 
@@ -88,6 +92,7 @@ func TestLoad_CustomValues(t *testing.T) {
 		os.Unsetenv("MODBUS_READONLY")
 		os.Unsetenv("MODBUS_TIMEOUT")
 		os.Unsetenv("MODBUS_REQUEST_DELAY")
+		os.Unsetenv("MODBUS_CONNECT_DELAY")
 		os.Unsetenv("MODBUS_SHUTDOWN_TIMEOUT")
 		os.Unsetenv("LOG_LEVEL")
 	}()
@@ -117,6 +122,9 @@ func TestLoad_CustomValues(t *testing.T) {
 	}
 	if cfg.RequestDelay != 100*time.Millisecond {
 		t.Errorf("expected 100ms request delay, got %v", cfg.RequestDelay)
+	}
+	if cfg.ConnectDelay != 200*time.Millisecond {
+		t.Errorf("expected 200ms connect delay, got %v", cfg.ConnectDelay)
 	}
 	if cfg.ShutdownTimeout != 60*time.Second {
 		t.Errorf("expected 60s shutdown timeout, got %v", cfg.ShutdownTimeout)
@@ -174,7 +182,7 @@ func TestLoad_InvalidDuration(t *testing.T) {
 	os.Setenv("MODBUS_UPSTREAM", "localhost:502")
 	defer os.Unsetenv("MODBUS_UPSTREAM")
 
-	tests := []string{"MODBUS_CACHE_TTL", "MODBUS_TIMEOUT", "MODBUS_REQUEST_DELAY", "MODBUS_SHUTDOWN_TIMEOUT"}
+	tests := []string{"MODBUS_CACHE_TTL", "MODBUS_TIMEOUT", "MODBUS_REQUEST_DELAY", "MODBUS_CONNECT_DELAY", "MODBUS_SHUTDOWN_TIMEOUT"}
 	for _, envVar := range tests {
 		os.Setenv(envVar, "invalid")
 		_, err := Load()

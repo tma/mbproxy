@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ type Client struct {
 	address      string
 	timeout      time.Duration
 	requestDelay time.Duration
+	connectDelay time.Duration
 	logger       *slog.Logger
 
 	mu     sync.Mutex
@@ -24,11 +26,12 @@ type Client struct {
 }
 
 // NewClient creates a new Modbus TCP client.
-func NewClient(address string, timeout, requestDelay time.Duration, logger *slog.Logger) *Client {
+func NewClient(address string, timeout, requestDelay, connectDelay time.Duration, logger *slog.Logger) *Client {
 	return &Client{
 		address:      address,
 		timeout:      timeout,
 		requestDelay: requestDelay,
+		connectDelay: connectDelay,
 		logger:       logger,
 	}
 }
@@ -46,9 +49,16 @@ func (c *Client) connectLocked(ctx context.Context) error {
 		c.conn.Close()
 	}
 
-	handler := modbus.NewTCPClientHandler(c.address)
+	// Custom dialer with TCP keep-alive for connection health monitoring
+	dialer := &net.Dialer{
+		Timeout:   c.timeout,
+		KeepAlive: 30 * time.Second,
+	}
+
+	handler := modbus.NewTCPClientHandler(c.address, modbus.WithDialer(dialer.DialContext))
 	handler.Timeout = c.timeout
 	handler.IdleTimeout = c.timeout
+	handler.ConnectDelay = c.connectDelay
 
 	if err := handler.Connect(ctx); err != nil {
 		return fmt.Errorf("connect to %s: %w", c.address, err)
@@ -56,6 +66,11 @@ func (c *Client) connectLocked(ctx context.Context) error {
 
 	c.conn = handler
 	c.client = modbus.NewClient(handler)
+
+	if c.connectDelay > 0 {
+		c.logger.Debug("applying connect delay", "delay", c.connectDelay)
+	}
+
 	c.logger.Info("connected to upstream", "address", c.address)
 	return nil
 }

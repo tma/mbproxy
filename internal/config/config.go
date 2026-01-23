@@ -28,6 +28,7 @@ type Config struct {
 	ReadOnly        ReadOnlyMode
 	Timeout         time.Duration
 	RequestDelay    time.Duration
+	ConnectDelay    time.Duration
 	ShutdownTimeout time.Duration
 	LogLevel        string
 }
@@ -43,6 +44,7 @@ func Load() (*Config, error) {
 		ReadOnly:        ReadOnlyOn,
 		Timeout:         10 * time.Second,
 		RequestDelay:    0,
+		ConnectDelay:    0,
 		ShutdownTimeout: 30 * time.Second,
 		LogLevel:        getEnv("LOG_LEVEL", "INFO"),
 	}
@@ -104,6 +106,15 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("invalid MODBUS_REQUEST_DELAY: %w", err)
 		}
 		cfg.RequestDelay = d
+	}
+
+	// Parse connect delay
+	if s := os.Getenv("MODBUS_CONNECT_DELAY"); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return nil, fmt.Errorf("invalid MODBUS_CONNECT_DELAY: %w", err)
+		}
+		cfg.ConnectDelay = d
 	}
 
 	// Parse shutdown timeout
