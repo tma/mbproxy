@@ -23,12 +23,17 @@ docker run --rm -e MODBUS_UPSTREAM=192.168.1.100:502 -e LOG_LEVEL=DEBUG mbproxy
 ## Testing
 
 ```bash
-# Run all tests
+# Run all tests with race detector (uses full golang image)
 docker build --target test .
 
-# Or run tests interactively
-docker run --rm -v $(pwd):/app -w /app golang:1.24 go test ./...
+# Or run tests interactively (without race detector in alpine)
+docker run --rm -v $(pwd):/app -w /app golang:1.24 go test -v ./...
+
+# With race detector (requires full golang image, not alpine)
+docker run --rm -v $(pwd):/app -w /app golang:1.24 go test -v -race ./...
 ```
+
+Note: Race detector requires CGO, which is not available in alpine images. The Dockerfile test stage uses the full golang image for this reason.
 
 ## Code Style
 
