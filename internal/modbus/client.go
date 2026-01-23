@@ -13,9 +13,10 @@ import (
 
 // Client wraps a Modbus TCP client with auto-reconnect capability.
 type Client struct {
-	address string
-	timeout time.Duration
-	logger  *slog.Logger
+	address      string
+	timeout      time.Duration
+	requestDelay time.Duration
+	logger       *slog.Logger
 
 	mu     sync.Mutex
 	client modbus.Client
@@ -23,11 +24,12 @@ type Client struct {
 }
 
 // NewClient creates a new Modbus TCP client.
-func NewClient(address string, timeout time.Duration, logger *slog.Logger) *Client {
+func NewClient(address string, timeout, requestDelay time.Duration, logger *slog.Logger) *Client {
 	return &Client{
-		address: address,
-		timeout: timeout,
-		logger:  logger,
+		address:      address,
+		timeout:      timeout,
+		requestDelay: requestDelay,
+		logger:       logger,
 	}
 }
 
@@ -99,6 +101,16 @@ func (c *Client) Execute(ctx context.Context, req *Request) ([]byte, error) {
 		resp, err = c.executeRequest(ctx, req)
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// Apply request delay if configured (only after successful requests)
+	if c.requestDelay > 0 {
+		c.logger.Debug("applying request delay", "duration", c.requestDelay)
+		select {
+		case <-time.After(c.requestDelay):
+		case <-ctx.Done():
+			// Context cancelled during delay - still return the successful result
 		}
 	}
 

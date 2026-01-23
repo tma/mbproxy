@@ -42,6 +42,7 @@ Many Modbus devices (inverters, meters, battery systems) have limited polling ca
 - Support multiple slave IDs through single connection
 - Support clients requesting different slave IDs through the proxy
 - Auto-reconnect on connection failure (unlimited retries, no backoff)
+- Request pacing: configurable delay between upstream requests to prevent overwhelming slow devices
 
 ### 3. In-Memory Cache
 
@@ -71,6 +72,13 @@ type CacheEntry struct {
 - Second request arriving while first is pending will wait for and share the first's response
 - Prevents thundering herd on cache miss
 
+### Request Pacing
+- Configurable delay after each successful upstream request
+- Protects slow Modbus devices that cannot handle rapid-fire requests
+- Delay is context-aware: cancelled if the request context is cancelled
+- Only applied after successful requests (not during error recovery/reconnection)
+- Logged at DEBUG level when applied
+
 ### 4. Read-Only Mode
 Three modes:
 - `false`: Full read/write passthrough
@@ -93,6 +101,7 @@ Three modes:
 | `MODBUS_CACHE_SERVE_STALE` | Serve stale data on upstream error | `false` | `true`, `false` |
 | `MODBUS_READONLY` | Read-only mode | `true` | `false`, `true`, `deny` |
 | `MODBUS_TIMEOUT` | Upstream connection timeout | `10s` | `5s`, `30s` |
+| `MODBUS_REQUEST_DELAY` | Delay after each upstream request | `0` (disabled) | `100ms`, `500ms` |
 | `MODBUS_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | `30s` | `10s`, `60s` |
 | `LOG_LEVEL` | Log level | `INFO` | `INFO`, `DEBUG` |
 
@@ -185,6 +194,7 @@ level=INFO msg="starting proxy" listen=:5502 upstream=192.168.1.100:502
 level=DEBUG msg="cache hit" slave_id=1 func=0x03 addr=0 qty=10
 level=DEBUG msg="cache miss" slave_id=1 func=0x03 addr=0 qty=10
 level=DEBUG msg="upstream read" slave_id=1 func=0x03 addr=0 qty=10 duration=15ms
+level=DEBUG msg="applying request delay" duration=100ms
 level=WARN msg="upstream error, serving stale" slave_id=1 error="timeout"
 level=INFO msg="shutting down"
 ```

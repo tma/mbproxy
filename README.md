@@ -34,6 +34,7 @@ All configuration is via environment variables:
 | `MODBUS_CACHE_SERVE_STALE` | Serve stale data on upstream error | `false` |
 | `MODBUS_READONLY` | Read-only mode: `false`, `true`, `deny` | `true` |
 | `MODBUS_TIMEOUT` | Upstream connection timeout | `10s` |
+| `MODBUS_REQUEST_DELAY` | Delay after each upstream request | `0` (disabled) |
 | `MODBUS_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | `30s` |
 | `LOG_LEVEL` | Log level: `INFO`, `DEBUG` | `INFO` |
 
@@ -74,6 +75,7 @@ services:
       MODBUS_CACHE_SERVE_STALE: "false"
       MODBUS_READONLY: "true"
       MODBUS_TIMEOUT: "10s"
+      MODBUS_REQUEST_DELAY: "0"
       MODBUS_SHUTDOWN_TIMEOUT: "30s"
       LOG_LEVEL: "INFO"
     restart: unless-stopped

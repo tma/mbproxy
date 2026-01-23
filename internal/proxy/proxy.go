@@ -27,7 +27,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	p := &Proxy{
 		cfg:    cfg,
 		logger: logger,
-		client: modbus.NewClient(cfg.Upstream, cfg.Timeout, logger),
+		client: modbus.NewClient(cfg.Upstream, cfg.Timeout, cfg.RequestDelay, logger),
 		cache:  cache.New(cfg.CacheTTL),
 	}
 
