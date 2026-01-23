@@ -1,0 +1,21 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+LICENSE
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build artifacts
+mbproxy
+*.exe
+
+# Test artifacts
+coverage.out
+coverage.html
