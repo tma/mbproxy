@@ -19,6 +19,7 @@ func TestLoad_Defaults(t *testing.T) {
 	os.Unsetenv("MODBUS_READONLY")
 	os.Unsetenv("MODBUS_TIMEOUT")
 	os.Unsetenv("MODBUS_SHUTDOWN_TIMEOUT")
+	os.Unsetenv("HEALTH_LISTEN")
 	os.Unsetenv("LOG_LEVEL")
 
 	cfg, err := Load()
@@ -56,6 +57,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.ShutdownTimeout != 30*time.Second {
 		t.Errorf("expected 30s shutdown timeout, got %v", cfg.ShutdownTimeout)
 	}
+	if cfg.HealthListen != ":8080" {
+		t.Errorf("expected :8080, got %s", cfg.HealthListen)
+	}
 	if cfg.LogLevel != "INFO" {
 		t.Errorf("expected INFO log level, got %s", cfg.LogLevel)
 	}
@@ -81,6 +85,7 @@ func TestLoad_CustomValues(t *testing.T) {
 	os.Setenv("MODBUS_REQUEST_DELAY", "100ms")
 	os.Setenv("MODBUS_CONNECT_DELAY", "200ms")
 	os.Setenv("MODBUS_SHUTDOWN_TIMEOUT", "60s")
+	os.Setenv("HEALTH_LISTEN", ":9090")
 	os.Setenv("LOG_LEVEL", "DEBUG")
 
 	defer func() {
@@ -94,6 +99,7 @@ func TestLoad_CustomValues(t *testing.T) {
 		os.Unsetenv("MODBUS_REQUEST_DELAY")
 		os.Unsetenv("MODBUS_CONNECT_DELAY")
 		os.Unsetenv("MODBUS_SHUTDOWN_TIMEOUT")
+		os.Unsetenv("HEALTH_LISTEN")
 		os.Unsetenv("LOG_LEVEL")
 	}()
 
@@ -128,6 +134,9 @@ func TestLoad_CustomValues(t *testing.T) {
 	}
 	if cfg.ShutdownTimeout != 60*time.Second {
 		t.Errorf("expected 60s shutdown timeout, got %v", cfg.ShutdownTimeout)
+	}
+	if cfg.HealthListen != ":9090" {
+		t.Errorf("expected :9090, got %s", cfg.HealthListen)
 	}
 	if cfg.LogLevel != "DEBUG" {
 		t.Errorf("expected DEBUG log level, got %s", cfg.LogLevel)

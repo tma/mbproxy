@@ -36,6 +36,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 	return p, nil
 }
 
+// Healthy reports whether the proxy's upstream connection is healthy.
+func (p *Proxy) Healthy() error {
+	return p.client.Healthy()
+}
+
 // Run starts the proxy server.
 func (p *Proxy) Run(ctx context.Context) error {
 	p.logger.Info("starting proxy",

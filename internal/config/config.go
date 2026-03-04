@@ -30,13 +30,14 @@ type Config struct {
 	RequestDelay    time.Duration
 	ConnectDelay    time.Duration
 	ShutdownTimeout time.Duration
+	HealthListen    string
 	LogLevel        string
 }
 
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Listen:          getEnv("MODBUS_LISTEN", ":5502"),
+		Listen:          GetEnv("MODBUS_LISTEN", ":5502"),
 		Upstream:        os.Getenv("MODBUS_UPSTREAM"),
 		DefaultSlaveID:  1,
 		CacheTTL:        10 * time.Second,
@@ -46,7 +47,8 @@ func Load() (*Config, error) {
 		RequestDelay:    0,
 		ConnectDelay:    0,
 		ShutdownTimeout: 30 * time.Second,
-		LogLevel:        getEnv("LOG_LEVEL", "INFO"),
+		HealthListen:    GetEnv("HEALTH_LISTEN", ":8080"),
+		LogLevel:        GetEnv("LOG_LEVEL", "INFO"),
 	}
 
 	if cfg.Upstream == "" {
@@ -129,7 +131,9 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-func getEnv(key, defaultValue string) string {
+// GetEnv returns the value of the environment variable named by key,
+// or defaultValue if the variable is not set.
+func GetEnv(key, defaultValue string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}

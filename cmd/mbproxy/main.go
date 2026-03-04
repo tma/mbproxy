@@ -2,17 +2,33 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/tma/mbproxy/internal/config"
+	"github.com/tma/mbproxy/internal/health"
 	"github.com/tma/mbproxy/internal/logging"
 	"github.com/tma/mbproxy/internal/proxy"
 )
 
 func main() {
+	healthCheck := flag.Bool("health", false, "run health check and exit")
+	flag.Parse()
+
+	if *healthCheck {
+		addr := config.GetEnv("HEALTH_LISTEN", ":8080")
+		if err := health.CheckHealth(addr); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("failed to load configuration", "error", err)
@@ -34,6 +50,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Start health server
+	hs := health.NewServer(cfg.HealthListen, p, logger)
+	hsLn, err := hs.Listen()
+	if err != nil {
+		logger.Error("failed to start health server", "error", err)
+		os.Exit(1)
+	}
+	go func() {
+		if err := hs.Serve(hsLn); err != nil {
+			logger.Error("health server error", "error", err)
+		}
+	}()
+
 	// Start proxy in background
 	errCh := make(chan error, 1)
 	go func() {
@@ -53,6 +82,13 @@ func main() {
 
 	// Graceful shutdown
 	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := hs.Shutdown(shutdownCtx); err != nil {
+		logger.Error("health server shutdown error", "error", err)
+	}
+
 	if err := p.Shutdown(cfg.ShutdownTimeout); err != nil {
 		logger.Error("shutdown error", "error", err)
 		os.Exit(1)

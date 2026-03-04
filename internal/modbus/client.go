@@ -23,6 +23,10 @@ type Client struct {
 	mu     sync.Mutex
 	client modbus.Client
 	conn   *modbus.TCPClientHandler
+
+	healthMu  sync.RWMutex
+	lastErr   error
+	connected bool
 }
 
 // NewClient creates a new Modbus TCP client.
@@ -61,11 +65,20 @@ func (c *Client) connectLocked(ctx context.Context) error {
 	handler.ConnectDelay = c.connectDelay
 
 	if err := handler.Connect(ctx); err != nil {
-		return fmt.Errorf("connect to %s: %w", c.address, err)
+		c.healthMu.Lock()
+		c.connected = false
+		c.lastErr = fmt.Errorf("connect to %s: %w", c.address, err)
+		c.healthMu.Unlock()
+		return c.lastErr
 	}
 
 	c.conn = handler
 	c.client = modbus.NewClient(handler)
+
+	c.healthMu.Lock()
+	c.connected = true
+	c.lastErr = nil
+	c.healthMu.Unlock()
 
 	if c.connectDelay > 0 {
 		c.logger.Debug("applying connect delay", "delay", c.connectDelay)
@@ -85,7 +98,27 @@ func (c *Client) Close() error {
 		c.conn = nil
 		c.client = nil
 	}
+
+	c.healthMu.Lock()
+	c.connected = false
+	c.healthMu.Unlock()
+
 	return nil
+}
+
+// Healthy reports whether the upstream connection is healthy.
+// It returns the last observed error, or nil if the last operation succeeded.
+func (c *Client) Healthy() error {
+	c.healthMu.RLock()
+	defer c.healthMu.RUnlock()
+
+	if !c.connected {
+		if c.lastErr != nil {
+			return c.lastErr
+		}
+		return fmt.Errorf("not connected")
+	}
+	return c.lastErr
 }
 
 // Execute sends a Modbus request and returns the response.
@@ -117,10 +150,17 @@ func (c *Client) Execute(ctx context.Context, req *Request) ([]byte, error) {
 		start = time.Now() // Reset timer for retry
 		resp, err = c.executeRequest(ctx, req)
 		if err != nil {
+			c.healthMu.Lock()
+			c.lastErr = err
+			c.healthMu.Unlock()
 			return nil, err
 		}
 	}
 	duration := time.Since(start)
+
+	c.healthMu.Lock()
+	c.lastErr = nil
+	c.healthMu.Unlock()
 
 	c.logger.Debug("upstream request completed",
 		"slave_id", req.SlaveID,
