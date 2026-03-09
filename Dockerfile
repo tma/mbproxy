@@ -31,7 +31,7 @@ FROM scratch
 
 COPY --from=builder /app/mbproxy /mbproxy
 
-HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD ["/mbproxy", "-health"]
 
 ENTRYPOINT ["/mbproxy"]
