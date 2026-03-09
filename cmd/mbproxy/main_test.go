@@ -10,7 +10,7 @@ import (
 	"github.com/tma/mbproxy/internal/config"
 )
 
-func testLogger() *slog.Logger {
+func newTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
@@ -34,7 +34,7 @@ func TestCheckUpstreamHealth_Success(t *testing.T) {
 		Upstream: ln.Addr().String(),
 		Timeout:  time.Second,
 	}
-	if err := checkUpstreamHealth(cfg, testLogger()); err != nil {
+	if err := checkUpstreamHealth(cfg, newTestLogger()); err != nil {
 		t.Fatalf("expected health check to succeed, got %v", err)
 	}
 
@@ -53,7 +53,7 @@ func TestCheckUpstreamHealth_Failure(t *testing.T) {
 		Upstream: addr,
 		Timeout:  100 * time.Millisecond,
 	}
-	if err := checkUpstreamHealth(cfg, testLogger()); err == nil {
+	if err := checkUpstreamHealth(cfg, newTestLogger()); err == nil {
 		t.Fatal("expected health check to fail")
 	}
 }

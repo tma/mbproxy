@@ -85,10 +85,14 @@ func runHealthCheck() error {
 	return checkUpstreamHealth(cfg, logging.New(cfg.LogLevel))
 }
 
-func checkUpstreamHealth(cfg *config.Config, logger *slog.Logger) error {
+func checkUpstreamHealth(cfg *config.Config, logger *slog.Logger) (err error) {
 	client := modbus.NewClient(cfg.Upstream, cfg.Timeout, cfg.RequestDelay, cfg.ConnectDelay, logger)
-	if err := client.Connect(); err != nil {
-		return err
-	}
-	return client.Close()
+	defer func() {
+		closeErr := client.Close()
+		if err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+
+	return client.Connect()
 }
