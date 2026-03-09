@@ -31,8 +31,6 @@ FROM scratch
 
 COPY --from=builder /app/mbproxy /mbproxy
 
-EXPOSE 8080
-
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=3 \
   CMD ["/mbproxy", "-health"]
 

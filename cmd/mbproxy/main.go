@@ -2,19 +2,16 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/tma/mbproxy/internal/config"
-	"github.com/tma/mbproxy/internal/health"
 	"github.com/tma/mbproxy/internal/logging"
+	"github.com/tma/mbproxy/internal/modbus"
 	"github.com/tma/mbproxy/internal/proxy"
 )
 
@@ -23,8 +20,7 @@ func main() {
 	flag.Parse()
 
 	if *healthCheck {
-		addr := config.GetEnv("HEALTH_LISTEN", ":8080")
-		if err := health.CheckHealth(addr); err != nil {
+		if err := runHealthCheck(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -52,21 +48,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start health server
-	hs := health.NewServer(cfg.HealthListen, p, logger)
-	hsLn, err := listenHealthServer(hs, cfg.HealthListen, cfg.HealthListen == config.DefaultHealthListen, logger)
-	if err != nil {
-		logger.Error("failed to start health server", "error", err)
-		os.Exit(1)
-	}
-	if hsLn != nil {
-		go func() {
-			if err := hs.Serve(hsLn); err != nil {
-				logger.Error("health server error", "error", err)
-			}
-		}()
-	}
-
 	// Start proxy in background
 	errCh := make(chan error, 1)
 	go func() {
@@ -87,14 +68,6 @@ func main() {
 	// Graceful shutdown
 	cancel()
 
-	if hsLn != nil {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer shutdownCancel()
-		if err := hs.Shutdown(shutdownCtx); err != nil {
-			logger.Error("health server shutdown error", "error", err)
-		}
-	}
-
 	if err := p.Shutdown(cfg.ShutdownTimeout); err != nil {
 		logger.Error("shutdown error", "error", err)
 		os.Exit(1)
@@ -103,16 +76,19 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func listenHealthServer(hs *health.Server, addr string, allowAddrInUseFallback bool, logger *slog.Logger) (net.Listener, error) {
-	ln, err := hs.Listen()
-	if err == nil {
-		return ln, nil
+func runHealthCheck() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
 	}
 
-	if allowAddrInUseFallback && errors.Is(err, syscall.EADDRINUSE) {
-		logger.Warn("health server disabled: listen address already in use", "addr", addr, "error", err)
-		return nil, nil
-	}
+	return checkUpstreamHealth(cfg, logging.New(cfg.LogLevel))
+}
 
-	return nil, err
+func checkUpstreamHealth(cfg *config.Config, logger *slog.Logger) error {
+	client := modbus.NewClient(cfg.Upstream, cfg.Timeout, cfg.RequestDelay, cfg.ConnectDelay, logger)
+	if err := client.Connect(); err != nil {
+		return err
+	}
+	return client.Close()
 }

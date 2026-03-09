@@ -37,10 +37,9 @@ All configuration is via environment variables:
 | `MODBUS_REQUEST_DELAY` | Delay after each upstream request | `0` (disabled) |
 | `MODBUS_CONNECT_DELAY` | Silent period after connecting to upstream | `0` (disabled) |
 | `MODBUS_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | `30s` |
-| `HEALTH_LISTEN` | HTTP health endpoint listen address | `:8080` |
 | `LOG_LEVEL` | Log level: `INFO`, `DEBUG` | `INFO` |
 
-If the default health listener (`:8080`) is already in use, mbproxy keeps the proxy running and disables the health endpoint for that instance. Set `HEALTH_LISTEN` to another free address if you need a health endpoint per instance.
+`/mbproxy -health` performs an internal upstream connectivity check and does not open a separate local TCP health port.
 
 ### Read-Only Modes
 
