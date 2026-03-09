@@ -106,6 +106,7 @@ Three modes:
 | `MODBUS_REQUEST_DELAY` | Delay after each upstream request | `0` (disabled) | `100ms`, `500ms` |
 | `MODBUS_CONNECT_DELAY` | Silent period after connecting to upstream | `0` (disabled) | `500ms`, `2s` |
 | `MODBUS_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | `30s` | `10s`, `60s` |
+| `HEALTH_LISTEN` | HTTP health endpoint listen address | `:8080` | `:8080`, `127.0.0.1:18080` |
 | `LOG_LEVEL` | Log level | `INFO` | `INFO`, `DEBUG` |
 
 ## Implementation Details

@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -52,16 +54,18 @@ func main() {
 
 	// Start health server
 	hs := health.NewServer(cfg.HealthListen, p, logger)
-	hsLn, err := hs.Listen()
+	hsLn, err := listenHealthServer(hs, cfg.HealthListen, cfg.HealthListen == config.DefaultHealthListen, logger)
 	if err != nil {
 		logger.Error("failed to start health server", "error", err)
 		os.Exit(1)
 	}
-	go func() {
-		if err := hs.Serve(hsLn); err != nil {
-			logger.Error("health server error", "error", err)
-		}
-	}()
+	if hsLn != nil {
+		go func() {
+			if err := hs.Serve(hsLn); err != nil {
+				logger.Error("health server error", "error", err)
+			}
+		}()
+	}
 
 	// Start proxy in background
 	errCh := make(chan error, 1)
@@ -83,10 +87,12 @@ func main() {
 	// Graceful shutdown
 	cancel()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := hs.Shutdown(shutdownCtx); err != nil {
-		logger.Error("health server shutdown error", "error", err)
+	if hsLn != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := hs.Shutdown(shutdownCtx); err != nil {
+			logger.Error("health server shutdown error", "error", err)
+		}
 	}
 
 	if err := p.Shutdown(cfg.ShutdownTimeout); err != nil {
@@ -95,4 +101,18 @@ func main() {
 	}
 
 	logger.Info("shutdown complete")
+}
+
+func listenHealthServer(hs *health.Server, addr string, allowAddrInUseFallback bool, logger *slog.Logger) (net.Listener, error) {
+	ln, err := hs.Listen()
+	if err == nil {
+		return ln, nil
+	}
+
+	if allowAddrInUseFallback && errors.Is(err, syscall.EADDRINUSE) {
+		logger.Warn("health server disabled: listen address already in use", "addr", addr, "error", err)
+		return nil, nil
+	}
+
+	return nil, err
 }

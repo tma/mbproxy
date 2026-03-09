@@ -34,6 +34,8 @@ type Config struct {
 	LogLevel        string
 }
 
+const DefaultHealthListen = ":8080"
+
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
 	cfg := &Config{
@@ -47,7 +49,7 @@ func Load() (*Config, error) {
 		RequestDelay:    0,
 		ConnectDelay:    0,
 		ShutdownTimeout: 30 * time.Second,
-		HealthListen:    GetEnv("HEALTH_LISTEN", ":8080"),
+		HealthListen:    GetEnv("HEALTH_LISTEN", DefaultHealthListen),
 		LogLevel:        GetEnv("LOG_LEVEL", "INFO"),
 	}
 
