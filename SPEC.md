@@ -108,6 +108,8 @@ Three modes:
 | `MODBUS_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | `30s` | `10s`, `60s` |
 | `LOG_LEVEL` | Log level | `INFO` | `INFO`, `DEBUG` |
 
+The container health check runs `mbproxy -health`, which performs an internal upstream connectivity check without binding a separate local TCP port.
+
 ## Implementation Details
 
 ### Dependencies

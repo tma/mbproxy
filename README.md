@@ -39,6 +39,8 @@ All configuration is via environment variables:
 | `MODBUS_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | `30s` |
 | `LOG_LEVEL` | Log level: `INFO`, `DEBUG` | `INFO` |
 
+`/mbproxy -health` performs an internal upstream connectivity check and does not open a separate local TCP health port.
+
 ### Read-Only Modes
 
 - `false`: Full read/write passthrough to upstream device

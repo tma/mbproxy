@@ -17,6 +17,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      CACHE_FROM: ${{ github.event_name == 'pull_request' && 'type=gha' || format('type=registry,ref=ghcr.io/{0}:buildcache', github.repository) }}
+      CACHE_TO: ${{ github.event_name == 'pull_request' && 'type=gha,mode=max' || format('type=registry,ref=ghcr.io/{0}:buildcache,mode=max', github.repository) }}
 
     steps:
       - uses: actions/checkout@v6
@@ -55,5 +58,5 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          cache-from: ${{ env.CACHE_FROM }}
+          cache-to: ${{ env.CACHE_TO }}

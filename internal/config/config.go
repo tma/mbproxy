@@ -30,7 +30,6 @@ type Config struct {
 	RequestDelay    time.Duration
 	ConnectDelay    time.Duration
 	ShutdownTimeout time.Duration
-	HealthListen    string
 	LogLevel        string
 }
 
@@ -47,7 +46,6 @@ func Load() (*Config, error) {
 		RequestDelay:    0,
 		ConnectDelay:    0,
 		ShutdownTimeout: 30 * time.Second,
-		HealthListen:    GetEnv("HEALTH_LISTEN", ":8080"),
 		LogLevel:        GetEnv("LOG_LEVEL", "INFO"),
 	}
 
