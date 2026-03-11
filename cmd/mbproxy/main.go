@@ -8,10 +8,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/tma/mbproxy/internal/config"
+	"github.com/tma/mbproxy/internal/health"
 	"github.com/tma/mbproxy/internal/logging"
-	"github.com/tma/mbproxy/internal/modbus"
 	"github.com/tma/mbproxy/internal/proxy"
 )
 
@@ -20,7 +21,12 @@ func main() {
 	flag.Parse()
 
 	if *healthCheck {
-		if err := runHealthCheck(); err != nil {
+		addr := os.Getenv("HEALTH_LISTEN")
+		if addr == "" {
+			fmt.Fprintln(os.Stderr, "HEALTH_LISTEN is not set")
+			os.Exit(1)
+		}
+		if err := health.CheckHealth(addr); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -48,6 +54,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Start health server if configured
+	var hs *health.Server
+	if cfg.HealthListen != "" {
+		hs = health.NewServer(cfg.HealthListen, p, logger)
+		hsLn, err := hs.Listen()
+		if err != nil {
+			logger.Error("failed to start health server", "error", err)
+			os.Exit(1)
+		}
+		go func() {
+			if err := hs.Serve(hsLn); err != nil {
+				logger.Error("health server error", "error", err)
+			}
+		}()
+	}
+
 	// Start proxy in background
 	errCh := make(chan error, 1)
 	go func() {
@@ -68,31 +90,18 @@ func main() {
 	// Graceful shutdown
 	cancel()
 
+	if hs != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := hs.Shutdown(shutdownCtx); err != nil {
+			logger.Error("health server shutdown error", "error", err)
+		}
+	}
+
 	if err := p.Shutdown(cfg.ShutdownTimeout); err != nil {
 		logger.Error("shutdown error", "error", err)
 		os.Exit(1)
 	}
 
 	logger.Info("shutdown complete")
-}
-
-func runHealthCheck() error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-
-	return checkUpstreamHealth(cfg, logging.New(cfg.LogLevel))
-}
-
-func checkUpstreamHealth(cfg *config.Config, logger *slog.Logger) (err error) {
-	client := modbus.NewClient(cfg.Upstream, cfg.Timeout, cfg.RequestDelay, cfg.ConnectDelay, logger)
-	defer func() {
-		closeErr := client.Close()
-		if err == nil && closeErr != nil {
-			err = closeErr
-		}
-	}()
-
-	return client.Connect()
 }

@@ -19,6 +19,7 @@ func TestLoad_Defaults(t *testing.T) {
 	os.Unsetenv("MODBUS_READONLY")
 	os.Unsetenv("MODBUS_TIMEOUT")
 	os.Unsetenv("MODBUS_SHUTDOWN_TIMEOUT")
+	os.Unsetenv("HEALTH_LISTEN")
 	os.Unsetenv("LOG_LEVEL")
 
 	cfg, err := Load()
@@ -55,6 +56,9 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.ShutdownTimeout != 30*time.Second {
 		t.Errorf("expected 30s shutdown timeout, got %v", cfg.ShutdownTimeout)
+	}
+	if cfg.HealthListen != "" {
+		t.Errorf("expected empty health listen, got %s", cfg.HealthListen)
 	}
 	if cfg.LogLevel != "INFO" {
 		t.Errorf("expected INFO log level, got %s", cfg.LogLevel)
@@ -190,5 +194,22 @@ func TestLoad_InvalidDuration(t *testing.T) {
 			t.Errorf("expected error for invalid %s", envVar)
 		}
 		os.Unsetenv(envVar)
+	}
+}
+
+func TestLoad_HealthListenCustom(t *testing.T) {
+	os.Setenv("MODBUS_UPSTREAM", "localhost:502")
+	os.Setenv("HEALTH_LISTEN", ":9090")
+	defer func() {
+		os.Unsetenv("MODBUS_UPSTREAM")
+		os.Unsetenv("HEALTH_LISTEN")
+	}()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.HealthListen != ":9090" {
+		t.Errorf("expected :9090, got %s", cfg.HealthListen)
 	}
 }
