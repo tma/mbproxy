@@ -149,3 +149,49 @@ func TestCheckHealth_ConnectionRefused(t *testing.T) {
 		t.Error("expected error for connection refused")
 	}
 }
+
+func TestCheckHealth_WildcardAddresses(t *testing.T) {
+	// Start a test server bound to localhost so wildcard addresses can reach it.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(Response{Status: "ok"})
+	}))
+	defer ts.Close()
+
+	_, port, err := net.SplitHostPort(ts.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to parse test server address: %v", err)
+	}
+
+	// Each of these listen-style addresses should be normalized to localhost.
+	wildcards := []string{
+		":" + port,        // empty host (":8080")
+		"0.0.0.0:" + port, // IPv4 wildcard
+		"[::]:" + port,    // IPv6 wildcard
+	}
+	for _, addr := range wildcards {
+		if err := CheckHealth(addr); err != nil {
+			t.Errorf("CheckHealth(%q) expected success, got: %v", addr, err)
+		}
+	}
+}
+
+func TestCheckHealth_IPv6Loopback(t *testing.T) {
+	// Start a test server bound to the IPv6 loopback address.
+	ln, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skip("IPv6 loopback not available:", err)
+	}
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(Response{Status: "ok"})
+	}))
+	ts.Listener = ln
+	ts.Start()
+	defer ts.Close()
+
+	addr := ts.Listener.Addr().String() // "[::1]:PORT"
+	if err := CheckHealth(addr); err != nil {
+		t.Errorf("CheckHealth(%q) expected success for IPv6 loopback, got: %v", addr, err)
+	}
+}

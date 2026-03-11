@@ -107,17 +107,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // CheckHealth performs an HTTP health check against the given address.
 // It returns nil if the endpoint responds with 200 OK.
+// Wildcard listen addresses (e.g. ":8080", "0.0.0.0:8080", "[::]:8080") are
+// normalized to localhost so they can be used as dial targets. IPv6 addresses
+// are handled correctly via net.JoinHostPort.
 func CheckHealth(addr string) error {
 	// Resolve the address so we can build a proper URL.
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("invalid address %q: %w", addr, err)
 	}
-	if host == "" {
+	// Normalize wildcard and empty hosts to localhost.
+	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "localhost"
 	}
 
-	url := fmt.Sprintf("http://%s:%s/health", host, port)
+	url := fmt.Sprintf("http://%s/health", net.JoinHostPort(host, port))
 
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Get(url)

@@ -198,12 +198,19 @@ func TestLoad_InvalidDuration(t *testing.T) {
 }
 
 func TestLoad_HealthListenCustom(t *testing.T) {
-	os.Setenv("MODBUS_UPSTREAM", "localhost:502")
-	os.Setenv("HEALTH_LISTEN", ":9090")
-	defer func() {
-		os.Unsetenv("MODBUS_UPSTREAM")
-		os.Unsetenv("HEALTH_LISTEN")
-	}()
+	// Ensure optional env vars that Load() may read do not inherit
+	// potentially invalid values from the surrounding environment.
+	t.Setenv("MODBUS_LISTEN", "")
+	t.Setenv("MODBUS_READONLY", "")
+	t.Setenv("MODBUS_CACHE_TTL", "")
+	t.Setenv("MODBUS_TIMEOUT", "")
+	t.Setenv("MODBUS_REQUEST_DELAY", "")
+	t.Setenv("MODBUS_CONNECT_DELAY", "")
+	t.Setenv("MODBUS_SHUTDOWN_TIMEOUT", "")
+
+	// Set required and explicitly tested env vars.
+	t.Setenv("MODBUS_UPSTREAM", "localhost:502")
+	t.Setenv("HEALTH_LISTEN", ":9090")
 
 	cfg, err := Load()
 	if err != nil {
