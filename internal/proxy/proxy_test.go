@@ -26,7 +26,8 @@ func (m *mockClient) Execute(ctx context.Context, req *modbus.Request) ([]byte, 
 
 func TestProxy_HandleReadCacheHit(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	c := cache.New(time.Second)
+	c := cache.New(time.Second, false)
+	defer c.Close()
 
 	p := &Proxy{
 		cfg: &config.Config{
@@ -38,15 +39,17 @@ func TestProxy_HandleReadCacheHit(t *testing.T) {
 		cache:  c,
 	}
 
-	// Pre-populate cache
-	key := cache.Key(1, modbus.FuncReadHoldingRegisters, 0, 10)
-	c.Set(key, []byte{0x03, 0x14, 0x00, 0x01}) // Function code + byte count + data
+	// Pre-populate cache with per-register values
+	c.SetRange(1, modbus.FuncReadHoldingRegisters, 0, [][]byte{
+		{0x00, 0x01},
+		{0x00, 0x02},
+	})
 
 	req := &modbus.Request{
 		SlaveID:      1,
 		FunctionCode: modbus.FuncReadHoldingRegisters,
 		Address:      0,
-		Quantity:     10,
+		Quantity:     2,
 	}
 
 	resp, err := p.HandleRequest(context.Background(), req)
@@ -54,8 +57,15 @@ func TestProxy_HandleReadCacheHit(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if string(resp) != string([]byte{0x03, 0x14, 0x00, 0x01}) {
-		t.Errorf("unexpected response: %v", resp)
+	// Expected assembled response: funcCode + byteCount + reg0 + reg1
+	expected := []byte{0x03, 0x04, 0x00, 0x01, 0x00, 0x02}
+	if len(resp) != len(expected) {
+		t.Fatalf("expected %d bytes, got %d", len(expected), len(resp))
+	}
+	for i := range expected {
+		if resp[i] != expected[i] {
+			t.Errorf("byte %d: expected 0x%02X, got 0x%02X", i, expected[i], resp[i])
+		}
 	}
 }
 
@@ -73,12 +83,15 @@ func TestProxy_HandleWriteReadOnlyMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			c := cache.New(time.Second, false)
+			defer c.Close()
+
 			p := &Proxy{
 				cfg: &config.Config{
 					ReadOnly: tt.mode,
 				},
 				logger: logger,
-				cache:  cache.New(time.Second),
+				cache:  c,
 			}
 
 			req := &modbus.Request{
@@ -104,13 +117,15 @@ func TestProxy_HandleWriteReadOnlyMode(t *testing.T) {
 
 func TestProxy_HandleUnknownFunction(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := cache.New(time.Second, false)
+	defer c.Close()
 
 	p := &Proxy{
 		cfg: &config.Config{
 			ReadOnly: config.ReadOnlyOn,
 		},
 		logger: logger,
-		cache:  cache.New(time.Second),
+		cache:  c,
 	}
 
 	req := &modbus.Request{
@@ -181,5 +196,216 @@ func TestProxy_BuildFakeWriteResponse(t *testing.T) {
 				t.Errorf("function code: got 0x%02X, want 0x%02X", resp[0], tt.req.FunctionCode)
 			}
 		})
+	}
+}
+
+func TestDecomposeResponse_Registers(t *testing.T) {
+	// Response: FC 0x03, byteCount=4, reg0=0x0001, reg1=0x0002
+	data := []byte{0x03, 0x04, 0x00, 0x01, 0x00, 0x02}
+	values := decomposeResponse(modbus.FuncReadHoldingRegisters, 2, data)
+
+	if len(values) != 2 {
+		t.Fatalf("expected 2 values, got %d", len(values))
+	}
+	if values[0][0] != 0x00 || values[0][1] != 0x01 {
+		t.Errorf("reg0: expected 0x0001, got 0x%02X%02X", values[0][0], values[0][1])
+	}
+	if values[1][0] != 0x00 || values[1][1] != 0x02 {
+		t.Errorf("reg1: expected 0x0002, got 0x%02X%02X", values[1][0], values[1][1])
+	}
+}
+
+func TestDecomposeResponse_Coils(t *testing.T) {
+	// Response: FC 0x01, byteCount=2, coils 0-9
+	// 0xCD = 1100_1101: coils 0,2,3,6,7 on
+	// 0x01 = 0000_0001: coil 8 on
+	data := []byte{0x01, 0x02, 0xCD, 0x01}
+	values := decomposeResponse(modbus.FuncReadCoils, 10, data)
+
+	if len(values) != 10 {
+		t.Fatalf("expected 10 values, got %d", len(values))
+	}
+
+	expected := []byte{1, 0, 1, 1, 0, 0, 1, 1, 1, 0}
+	for i, exp := range expected {
+		if values[i][0] != exp {
+			t.Errorf("coil %d: expected %d, got %d", i, exp, values[i][0])
+		}
+	}
+}
+
+func TestAssembleResponse_Registers(t *testing.T) {
+	values := [][]byte{{0x00, 0x01}, {0x00, 0x02}}
+	resp := assembleResponse(modbus.FuncReadHoldingRegisters, 2, values)
+
+	expected := []byte{0x03, 0x04, 0x00, 0x01, 0x00, 0x02}
+	if len(resp) != len(expected) {
+		t.Fatalf("expected %d bytes, got %d", len(expected), len(resp))
+	}
+	for i := range expected {
+		if resp[i] != expected[i] {
+			t.Errorf("byte %d: expected 0x%02X, got 0x%02X", i, expected[i], resp[i])
+		}
+	}
+}
+
+func TestAssembleResponse_Coils(t *testing.T) {
+	// Coils 0,2,3,6,7 on, 8 on — should produce 0xCD 0x01
+	values := [][]byte{{1}, {0}, {1}, {1}, {0}, {0}, {1}, {1}, {1}, {0}}
+	resp := assembleResponse(modbus.FuncReadCoils, 10, values)
+
+	expected := []byte{0x01, 0x02, 0xCD, 0x01}
+	if len(resp) != len(expected) {
+		t.Fatalf("expected %d bytes, got %d", len(expected), len(resp))
+	}
+	for i := range expected {
+		if resp[i] != expected[i] {
+			t.Errorf("byte %d: expected 0x%02X, got 0x%02X", i, expected[i], resp[i])
+		}
+	}
+}
+
+func TestDecomposeAssemble_Roundtrip(t *testing.T) {
+	tests := []struct {
+		name     string
+		funcCode byte
+		quantity uint16
+		data     []byte
+	}{
+		{
+			name:     "holding registers",
+			funcCode: modbus.FuncReadHoldingRegisters,
+			quantity: 3,
+			data:     []byte{0x03, 0x06, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03},
+		},
+		{
+			name:     "input registers",
+			funcCode: modbus.FuncReadInputRegisters,
+			quantity: 2,
+			data:     []byte{0x04, 0x04, 0xFF, 0xFF, 0x00, 0x00},
+		},
+		{
+			name:     "coils",
+			funcCode: modbus.FuncReadCoils,
+			quantity: 10,
+			data:     []byte{0x01, 0x02, 0xCD, 0x01},
+		},
+		{
+			name:     "discrete inputs",
+			funcCode: modbus.FuncReadDiscreteInputs,
+			quantity: 8,
+			data:     []byte{0x02, 0x01, 0xAC},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := decomposeResponse(tt.funcCode, tt.quantity, tt.data)
+			if values == nil {
+				t.Fatal("decomposeResponse returned nil")
+			}
+
+			reassembled := assembleResponse(tt.funcCode, tt.quantity, values)
+			if len(reassembled) != len(tt.data) {
+				t.Fatalf("length mismatch: expected %d, got %d", len(tt.data), len(reassembled))
+			}
+			for i := range tt.data {
+				if reassembled[i] != tt.data[i] {
+					t.Errorf("byte %d: expected 0x%02X, got 0x%02X", i, tt.data[i], reassembled[i])
+				}
+			}
+		})
+	}
+}
+
+func TestProxy_WriteInvalidatesOverlappingReads(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := cache.New(time.Second, false)
+	defer c.Close()
+
+	p := &Proxy{
+		cfg: &config.Config{
+			ReadOnly: config.ReadOnlyOn,
+		},
+		logger: logger,
+		cache:  c,
+	}
+
+	// Cache registers 0-9 (simulating a previous read of range 0-9)
+	regs := make([][]byte, 10)
+	for i := range regs {
+		regs[i] = []byte{0x00, byte(i)}
+	}
+	c.SetRange(1, modbus.FuncReadHoldingRegisters, 0, regs)
+
+	// Write to register 5 — should invalidate register 5
+	p.invalidateCache(&modbus.Request{
+		SlaveID:      1,
+		FunctionCode: modbus.FuncWriteSingleRegister,
+		Address:      5,
+		Quantity:     1,
+	})
+
+	// Full range 0-9 should now miss (register 5 is gone)
+	_, ok := c.GetRange(1, modbus.FuncReadHoldingRegisters, 0, 10)
+	if ok {
+		t.Error("expected range miss after write invalidation of register 5")
+	}
+
+	// Registers 0-4 and 6-9 should still be cached individually
+	for i := uint16(0); i < 10; i++ {
+		_, ok := c.Get(cache.RegKey(1, modbus.FuncReadHoldingRegisters, i))
+		if i == 5 {
+			if ok {
+				t.Error("register 5 should be invalidated")
+			}
+		} else {
+			if !ok {
+				t.Errorf("register %d should still be cached", i)
+			}
+		}
+	}
+}
+
+func TestProxy_WriteInvalidatesMultipleRegisters(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := cache.New(time.Second, false)
+	defer c.Close()
+
+	p := &Proxy{
+		cfg: &config.Config{
+			ReadOnly: config.ReadOnlyOn,
+		},
+		logger: logger,
+		cache:  c,
+	}
+
+	// Cache registers 0-9
+	regs := make([][]byte, 10)
+	for i := range regs {
+		regs[i] = []byte{0x00, byte(i)}
+	}
+	c.SetRange(1, modbus.FuncReadHoldingRegisters, 0, regs)
+
+	// Write to registers 3-5 (write multiple)
+	p.invalidateCache(&modbus.Request{
+		SlaveID:      1,
+		FunctionCode: modbus.FuncWriteMultipleRegs,
+		Address:      3,
+		Quantity:     3,
+	})
+
+	// Registers 3,4,5 should be gone
+	for i := uint16(3); i <= 5; i++ {
+		if _, ok := c.Get(cache.RegKey(1, modbus.FuncReadHoldingRegisters, i)); ok {
+			t.Errorf("register %d should be invalidated", i)
+		}
+	}
+
+	// Registers 0,1,2,6,7,8,9 should still be cached
+	for _, i := range []uint16{0, 1, 2, 6, 7, 8, 9} {
+		if _, ok := c.Get(cache.RegKey(1, modbus.FuncReadHoldingRegisters, i)); !ok {
+			t.Errorf("register %d should still be cached", i)
+		}
 	}
 }
