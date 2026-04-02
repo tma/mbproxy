@@ -122,15 +122,15 @@ func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, er
 	}
 
 	// Cache miss — fetch with coalescing
+	p.logger.Debug("cache miss",
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+		"addr", req.Address,
+		"qty", req.Quantity,
+	)
+
 	rangeKey := cache.RangeKey(req.SlaveID, req.FunctionCode, req.Address, req.Quantity)
 	data, err := p.cache.Coalesce(ctx, rangeKey, func(ctx context.Context) ([]byte, error) {
-		p.logger.Debug("cache miss",
-			"slave_id", req.SlaveID,
-			"func", fmt.Sprintf("0x%02X", req.FunctionCode),
-			"addr", req.Address,
-			"qty", req.Quantity,
-		)
-
 		return p.client.Execute(ctx, req)
 	})
 
