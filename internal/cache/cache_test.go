@@ -374,29 +374,24 @@ func TestCache_KeepStale(t *testing.T) {
 	c.Set("key1", []byte("value1"))
 	time.Sleep(100 * time.Millisecond)
 
-	// Simulate cleanup
-	c.mu.Lock()
-	for key, entry := range c.entries {
-		if entry.IsExpired() {
-			delete(c.entries, key)
-		}
-	}
-	c.mu.Unlock()
+	c.cleanupOnce()
 
 	if _, ok := c.GetStale("key1"); ok {
 		t.Error("expected stale data to be gone after cleanup with keepStale=false")
 	}
 	c.Close()
 
-	// With keepStale=true, expired entries survive cleanup
+	// With keepStale=true, cleanup skips deletion
 	c2 := New(50*time.Millisecond, true)
 	c2.Set("key1", []byte("value1"))
 	time.Sleep(100 * time.Millisecond)
 
-	// Entry should still be accessible via GetStale
+	c2.cleanupOnce()
+
+	// Entry should still be accessible via GetStale after cleanup
 	data, ok := c2.GetStale("key1")
 	if !ok {
-		t.Error("expected stale data to survive with keepStale=true")
+		t.Error("expected stale data to survive cleanup with keepStale=true")
 	}
 	if string(data) != "value1" {
 		t.Errorf("expected value1, got %s", string(data))

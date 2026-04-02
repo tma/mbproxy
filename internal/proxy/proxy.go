@@ -207,6 +207,12 @@ func (p *Proxy) invalidateCache(req *modbus.Request) {
 	}
 }
 
+// Shared byte slices for coil values — safe to reuse since SetRange copies.
+var (
+	coilOn  = []byte{1}
+	coilOff = []byte{0}
+)
+
 // decomposeResponse extracts per-register/coil values from a Modbus read response.
 // Response format: [funcCode, byteCount, data...]
 // For registers (FC 0x03, 0x04): each register is 2 bytes.
@@ -241,9 +247,9 @@ func decomposeResponse(functionCode byte, quantity uint16, data []byte) [][]byte
 				return nil
 			}
 			if payload[byteIdx]&(1<<bitIdx) != 0 {
-				values[i] = []byte{1}
+				values[i] = coilOn
 			} else {
-				values[i] = []byte{0}
+				values[i] = coilOff
 			}
 		}
 		return values
