@@ -132,6 +132,10 @@ func (c *Cache) Delete(key string) {
 // GetRange retrieves all values for a contiguous register range.
 // Returns the per-register/coil values and true only if ALL are cached and fresh.
 func (c *Cache) GetRange(slaveID byte, functionCode byte, startAddr uint16, quantity uint16) ([][]byte, bool) {
+	if quantity == 0 {
+		return nil, false
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -152,6 +156,10 @@ func (c *Cache) GetRange(slaveID byte, functionCode byte, startAddr uint16, quan
 // GetRangeStale retrieves all values for a contiguous register range, ignoring TTL.
 // Returns the per-register/coil values and true only if ALL are present (even if expired).
 func (c *Cache) GetRangeStale(slaveID byte, functionCode byte, startAddr uint16, quantity uint16) ([][]byte, bool) {
+	if quantity == 0 {
+		return nil, false
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -250,6 +258,21 @@ func (c *Cache) Coalesce(ctx context.Context, key string, fetch func(context.Con
 	return result, nil
 }
 
+// cleanupOnce runs a single cleanup pass, removing expired entries.
+// Skips deletion when keepStale is true.
+func (c *Cache) cleanupOnce() {
+	if c.keepStale {
+		return
+	}
+	c.mu.Lock()
+	for key, entry := range c.entries {
+		if entry.IsExpired() {
+			delete(c.entries, key)
+		}
+	}
+	c.mu.Unlock()
+}
+
 // cleanup periodically removes expired entries.
 func (c *Cache) cleanup() {
 	ticker := time.NewTicker(time.Minute)
@@ -260,16 +283,7 @@ func (c *Cache) cleanup() {
 		case <-c.done:
 			return
 		case <-ticker.C:
-			if c.keepStale {
-				continue
-			}
-			c.mu.Lock()
-			for key, entry := range c.entries {
-				if entry.IsExpired() {
-					delete(c.entries, key)
-				}
-			}
-			c.mu.Unlock()
+			c.cleanupOnce()
 		}
 	}
 }
