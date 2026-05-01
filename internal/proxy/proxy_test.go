@@ -25,6 +25,8 @@ func (m *mockClient) Connect() error { return nil }
 
 func (m *mockClient) Close() error { return nil }
 
+func (m *mockClient) Healthy() error { return nil }
+
 func (m *mockClient) Execute(ctx context.Context, req *modbus.Request) ([]byte, error) {
 	m.calls++
 	return m.response, m.err

@@ -16,6 +16,7 @@ import (
 type upstreamClient interface {
 	Connect() error
 	Close() error
+	Healthy() error
 	Execute(context.Context, *modbus.Request) ([]byte, error)
 }
 
