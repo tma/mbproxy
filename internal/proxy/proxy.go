@@ -13,12 +13,19 @@ import (
 	"github.com/tma/mbproxy/internal/modbus"
 )
 
+type upstreamClient interface {
+	Connect() error
+	Close() error
+	Healthy() error
+	Execute(context.Context, *modbus.Request) ([]byte, error)
+}
+
 // Proxy is a caching Modbus proxy server.
 type Proxy struct {
 	cfg    *config.Config
 	logger *slog.Logger
 	server *modbus.Server
-	client *modbus.Client
+	client upstreamClient
 	cache  *cache.Cache
 }
 
@@ -28,7 +35,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
 		cfg:    cfg,
 		logger: logger,
 		client: modbus.NewClient(cfg.Upstream, cfg.Timeout, cfg.RequestDelay, cfg.ConnectDelay, logger),
-		cache:  cache.New(cfg.CacheTTL),
+		cache:  cache.New(cfg.CacheTTL, cfg.CacheServeStale),
 	}
 
 	p.server = modbus.NewServer(p, logger)
@@ -109,34 +116,8 @@ func (p *Proxy) HandleRequest(ctx context.Context, req *modbus.Request) ([]byte,
 }
 
 func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, error) {
-	key := cache.Key(req.SlaveID, req.FunctionCode, req.Address, req.Quantity)
-
-	// Use GetOrFetch for request coalescing
-	data, cacheHit, err := p.cache.GetOrFetch(ctx, key, func(ctx context.Context) ([]byte, error) {
-		p.logger.Debug("cache miss",
-			"slave_id", req.SlaveID,
-			"func", fmt.Sprintf("0x%02X", req.FunctionCode),
-			"addr", req.Address,
-			"qty", req.Quantity,
-		)
-
-		return p.client.Execute(ctx, req)
-	})
-
-	if err != nil {
-		// Try serving stale data if configured
-		if p.cfg.CacheServeStale {
-			if stale, ok := p.cache.GetStale(key); ok {
-				p.logger.Warn("upstream error, serving stale",
-					"slave_id", req.SlaveID,
-					"error", err,
-				)
-				return stale, nil
-			}
-		}
-		return nil, err
-	}
-
+	// Check per-register cache
+	values, cacheHit := p.cache.GetRange(req.SlaveID, req.FunctionCode, req.Address, req.Quantity)
 	if cacheHit {
 		p.logger.Debug("cache hit",
 			"slave_id", req.SlaveID,
@@ -144,6 +125,40 @@ func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, er
 			"addr", req.Address,
 			"qty", req.Quantity,
 		)
+		return assembleResponse(req.FunctionCode, req.Quantity, values), nil
+	}
+
+	// Cache miss — fetch with coalescing
+	p.logger.Debug("cache miss",
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+		"addr", req.Address,
+		"qty", req.Quantity,
+	)
+
+	rangeKey := cache.RangeKey(req.SlaveID, req.FunctionCode, req.Address, req.Quantity)
+	data, err := p.cache.Coalesce(ctx, rangeKey, func(ctx context.Context) ([]byte, error) {
+		return p.client.Execute(ctx, req)
+	})
+
+	if err != nil {
+		// Try serving stale data if configured
+		if p.cfg.CacheServeStale {
+			if staleValues, ok := p.cache.GetRangeStale(req.SlaveID, req.FunctionCode, req.Address, req.Quantity); ok {
+				p.logger.Warn("upstream error, serving stale",
+					"slave_id", req.SlaveID,
+					"error", err,
+				)
+				return assembleResponse(req.FunctionCode, req.Quantity, staleValues), nil
+			}
+		}
+		return nil, err
+	}
+
+	// Decompose response and store per-register
+	regValues := decomposeResponse(req.FunctionCode, req.Quantity, data)
+	if regValues != nil {
+		p.cache.SetRange(req.SlaveID, req.FunctionCode, req.Address, regValues)
 	}
 
 	return data, nil
@@ -176,7 +191,7 @@ func (p *Proxy) handleWrite(ctx context.Context, req *modbus.Request) ([]byte, e
 			return nil, err
 		}
 
-		// Invalidate exact matching cache entries for all read function codes
+		// Invalidate per-register cache entries for the written range
 		p.invalidateCache(req)
 
 		return resp, nil
@@ -186,7 +201,7 @@ func (p *Proxy) handleWrite(ctx context.Context, req *modbus.Request) ([]byte, e
 }
 
 func (p *Proxy) invalidateCache(req *modbus.Request) {
-	// Invalidate exact matches for all read function codes that could overlap
+	// Invalidate per-register entries for all read function codes
 	readFuncs := []byte{
 		modbus.FuncReadCoils,
 		modbus.FuncReadDiscreteInputs,
@@ -195,9 +210,93 @@ func (p *Proxy) invalidateCache(req *modbus.Request) {
 	}
 
 	for _, fc := range readFuncs {
-		key := cache.Key(req.SlaveID, fc, req.Address, req.Quantity)
-		p.cache.Delete(key)
+		p.cache.DeleteRange(req.SlaveID, fc, req.Address, req.Quantity)
 	}
+}
+
+// Shared byte slices for coil values — safe to reuse since SetRange copies.
+var (
+	coilOn  = []byte{1}
+	coilOff = []byte{0}
+)
+
+// decomposeResponse extracts per-register/coil values from a Modbus read response.
+// Response format: [funcCode, byteCount, data...]
+// For registers (FC 0x03, 0x04): each register is 2 bytes.
+// For coils/discrete inputs (FC 0x01, 0x02): each coil is 1 bit, stored as 1 byte (0 or 1).
+func decomposeResponse(functionCode byte, quantity uint16, data []byte) [][]byte {
+	if len(data) < 2 {
+		return nil
+	}
+
+	payload := data[2:] // Skip funcCode and byteCount
+
+	switch functionCode {
+	case modbus.FuncReadHoldingRegisters, modbus.FuncReadInputRegisters:
+		values := make([][]byte, quantity)
+		for i := uint16(0); i < quantity; i++ {
+			offset := i * 2
+			if int(offset+2) > len(payload) {
+				return nil
+			}
+			reg := make([]byte, 2)
+			copy(reg, payload[offset:offset+2])
+			values[i] = reg
+		}
+		return values
+
+	case modbus.FuncReadCoils, modbus.FuncReadDiscreteInputs:
+		values := make([][]byte, quantity)
+		for i := uint16(0); i < quantity; i++ {
+			byteIdx := i / 8
+			bitIdx := i % 8
+			if int(byteIdx) >= len(payload) {
+				return nil
+			}
+			if payload[byteIdx]&(1<<bitIdx) != 0 {
+				values[i] = coilOn
+			} else {
+				values[i] = coilOff
+			}
+		}
+		return values
+	}
+
+	return nil
+}
+
+// assembleResponse reconstructs a Modbus read response from per-register/coil values.
+func assembleResponse(functionCode byte, quantity uint16, values [][]byte) []byte {
+	switch functionCode {
+	case modbus.FuncReadHoldingRegisters, modbus.FuncReadInputRegisters:
+		byteCount := quantity * 2
+		resp := make([]byte, 2+byteCount)
+		resp[0] = functionCode
+		resp[1] = byte(byteCount)
+		for i, v := range values {
+			if len(v) >= 2 {
+				resp[2+i*2] = v[0]
+				resp[2+i*2+1] = v[1]
+			}
+		}
+		return resp
+
+	case modbus.FuncReadCoils, modbus.FuncReadDiscreteInputs:
+		byteCount := (quantity + 7) / 8
+		resp := make([]byte, 2+byteCount)
+		resp[0] = functionCode
+		resp[1] = byte(byteCount)
+		for i, v := range values {
+			if len(v) > 0 && v[0] != 0 {
+				byteIdx := i / 8
+				bitIdx := uint(i % 8)
+				resp[2+byteIdx] |= 1 << bitIdx
+			}
+		}
+		return resp
+	}
+
+	return nil
 }
 
 func (p *Proxy) buildFakeWriteResponse(req *modbus.Request) []byte {

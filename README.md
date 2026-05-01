@@ -134,10 +134,12 @@ docker run --rm -v $(pwd):/app -w /app golang:1.24 go test ./...
 
 ## Cache Behavior
 
-- **Key format**: `{slave_id}:{function_code}:{start_address}:{quantity}`
-- **Read requests**: Served from cache if available and not expired
-- **Write requests**: Forwarded to upstream (if allowed), exact matching cache entries invalidated
-- **Request coalescing**: Multiple identical requests during a cache miss share a single upstream fetch
+- **Key format**: values are cached per register/coil as `{slave_id}:{function_code}:{address}`
+- **Read requests**: Served from cache only if every register/coil in the requested range is present and not expired
+- **Cache misses**: If any value in the requested range is missing or expired, the full range is fetched from upstream and decomposed into per-register/coil cache entries
+- **Write requests**: Forwarded to upstream (if allowed), then invalidate the written address range so overlapping cached reads cannot return stale values
+- **Request coalescing**: Multiple identical range requests during a cache miss share a single upstream fetch using `{slave_id}:{function_code}:{start_address}:{quantity}` as the coalescing key
+- **Stale fallback**: If enabled, expired entries are retained and can be served when upstream requests fail
 
 ## License
 

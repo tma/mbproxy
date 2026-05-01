@@ -49,6 +49,13 @@ Many Modbus devices (inverters, meters, battery systems) have limited polling ca
 ### 3. In-Memory Cache
 
 #### Cache Key Structure
+
+Values are cached per register/coil:
+```
+{slave_id}:{function_code}:{address}
+```
+
+Request coalescing still uses the requested range as its key:
 ```
 {slave_id}:{function_code}:{start_address}:{quantity}
 ```
@@ -56,21 +63,22 @@ Many Modbus devices (inverters, meters, battery systems) have limited polling ca
 #### Cache Entry
 ```go
 type CacheEntry struct {
-    Data      []byte
+    Data      []byte        // one register (2 bytes) or one coil/input bit (1 byte: 0 or 1)
     Timestamp time.Time
     TTL       time.Duration
 }
 ```
 
 #### Cache Behavior
-- **Read Operations**: Check cache first, return if valid (not expired)
-- **Write Operations**: Always forward to device, invalidate exact matching cache entries (same slave_id, function_code, start_address, quantity)
+- **Read Operations**: Check the per-register/coil cache first. Return from cache only if every value in the requested range is present and not expired.
+- **Cache Misses**: If any value in the requested range is missing or expired, fetch the full requested range from upstream, then decompose the response into per-register/coil cache entries.
+- **Write Operations**: Always forward to the device when writes are allowed, then invalidate each cached register/coil in the written address range. This prevents overlapping cached read ranges from serving stale values after frequent writes.
 - **TTL**: Configurable (default: 10 seconds)
-- **Cleanup**: Time-based expiration (entries removed when TTL expires)
-- **Staleness**: Option to serve stale data on upstream failure (default: off)
+- **Cleanup**: Time-based expiration. Expired entries are removed during cleanup unless stale serving is enabled.
+- **Staleness**: Option to serve stale data on upstream failure (default: off). When enabled, expired entries are retained so they remain available for fallback.
 
 ### Request Coalescing
-- Identical in-flight requests are coalesced (same slave_id, function, address, quantity)
+- Identical in-flight range requests are coalesced (same slave_id, function, address, quantity)
 - Second request arriving while first is pending will wait for and share the first's response
 - Prevents thundering herd on cache miss
 
@@ -144,47 +152,82 @@ type CachingHandler struct {
 
 ```go
 type Cache struct {
-    mu      sync.RWMutex
-    entries map[string]*CacheEntry
-    ttl     time.Duration  // default: 10 * time.Second
+    mu         sync.RWMutex
+    entries    map[string]*CacheEntry
+    defaultTTL time.Duration
+    keepStale  bool
+
+    // Request coalescing for identical range requests.
+    inflight   map[string]*inflightRequest
+    inflightMu sync.Mutex
 }
 
-func (c *Cache) Get(key string) ([]byte, bool) {
-    c.mu.RLock()
-    defer c.mu.RUnlock()
-    
-    entry, ok := c.entries[key]
-    if !ok || time.Since(entry.Timestamp) > entry.TTL {
+func RegKey(slaveID, functionCode byte, address uint16) string {
+    return fmt.Sprintf("%d:%d:%d", slaveID, functionCode, address)
+}
+
+func RangeKey(slaveID, functionCode byte, address, quantity uint16) string {
+    return fmt.Sprintf("%d:%d:%d:%d", slaveID, functionCode, address, quantity)
+}
+
+func (c *Cache) GetRange(slaveID, functionCode byte, address, quantity uint16) ([][]byte, bool) {
+    if quantity == 0 {
         return nil, false
     }
-    return entry.Data, true
+
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+
+    values := make([][]byte, quantity)
+    for i := uint16(0); i < quantity; i++ {
+        entry, ok := c.entries[RegKey(slaveID, functionCode, address+i)]
+        if !ok || entry.IsExpired() {
+            return nil, false
+        }
+        values[i] = append([]byte(nil), entry.Data...)
+    }
+    return values, true
 }
 
-func (c *Cache) Set(key string, data []byte, ttl time.Duration) {
+func (c *Cache) SetRange(slaveID, functionCode byte, address uint16, values [][]byte) {
     c.mu.Lock()
     defer c.mu.Unlock()
-    
-    c.entries[key] = &CacheEntry{
-        Data:      data,
-        Timestamp: time.Now(),
-        TTL:       ttl,
+
+    now := time.Now()
+    for i, value := range values {
+        c.entries[RegKey(slaveID, functionCode, address+uint16(i))] = &CacheEntry{
+            Data:      append([]byte(nil), value...),
+            Timestamp: now,
+            TTL:       c.defaultTTL,
+        }
+    }
+}
+
+func (c *Cache) DeleteRange(slaveID, functionCode byte, address, quantity uint16) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    for i := uint16(0); i < quantity; i++ {
+        delete(c.entries, RegKey(slaveID, functionCode, address+i))
     }
 }
 ```
+
+The cache also exposes `Coalesce(ctx, rangeKey, fetch)` for request coalescing. It does not read or write cache entries directly; the proxy performs cache lookups and stores decomposed responses.
 
 ### Request Flow
 
 1. Client sends Modbus TCP request
 2. Parse request: extract slave ID, function code, address, quantity
 3. **For reads**:
-   - Build cache key
-   - Check cache → if hit & valid, return cached data
-   - On miss: forward to upstream device
-   - Store response in cache
+   - Check every per-register/coil cache key in the requested range
+   - If all values are present and valid, reassemble and return the Modbus response
+   - On any miss or expired value: coalesce identical in-flight range requests, then forward to upstream device
+   - Decompose successful upstream responses into per-register/coil cache entries
    - Return response to client
 4. **For writes**:
    - Check readonly mode
-   - If allowed: forward to upstream, optionally invalidate cache
+   - If allowed: forward to upstream, then invalidate every cached register/coil in the written address range
    - Return response
 
 ## Logging
