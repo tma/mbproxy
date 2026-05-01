@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -18,6 +20,10 @@ type mockClient struct {
 	err      error
 	calls    int
 }
+
+func (m *mockClient) Connect() error { return nil }
+
+func (m *mockClient) Close() error { return nil }
 
 func (m *mockClient) Execute(ctx context.Context, req *modbus.Request) ([]byte, error) {
 	m.calls++
@@ -66,6 +72,113 @@ func TestProxy_HandleReadCacheHit(t *testing.T) {
 		if resp[i] != expected[i] {
 			t.Errorf("byte %d: expected 0x%02X, got 0x%02X", i, expected[i], resp[i])
 		}
+	}
+}
+
+func TestProxy_HandleReadMissFetchesAndCaches(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := cache.New(time.Second, false)
+	defer c.Close()
+
+	upstream := &mockClient{
+		response: []byte{0x03, 0x04, 0x00, 0x0A, 0x00, 0x0B},
+	}
+	p := &Proxy{
+		cfg: &config.Config{
+			CacheTTL:        time.Second,
+			CacheServeStale: false,
+			ReadOnly:        config.ReadOnlyOn,
+		},
+		logger: logger,
+		client: upstream,
+		cache:  c,
+	}
+
+	req := &modbus.Request{
+		SlaveID:      1,
+		FunctionCode: modbus.FuncReadHoldingRegisters,
+		Address:      10,
+		Quantity:     2,
+	}
+
+	resp, err := p.HandleRequest(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := []byte{0x03, 0x04, 0x00, 0x0A, 0x00, 0x0B}
+	if !bytes.Equal(resp, expected) {
+		t.Fatalf("first response: expected %v, got %v", expected, resp)
+	}
+	if upstream.calls != 1 {
+		t.Fatalf("expected 1 upstream call after miss, got %d", upstream.calls)
+	}
+
+	values, ok := c.GetRange(1, modbus.FuncReadHoldingRegisters, 10, 2)
+	if !ok {
+		t.Fatal("expected fetched response to be cached per register")
+	}
+	if !bytes.Equal(values[0], []byte{0x00, 0x0A}) || !bytes.Equal(values[1], []byte{0x00, 0x0B}) {
+		t.Fatalf("unexpected cached values: %v", values)
+	}
+
+	// Change the upstream response. The second request should be served from cache,
+	// so the upstream should not be called again and the response should stay the same.
+	upstream.response = []byte{0x03, 0x04, 0x00, 0xFF, 0x00, 0xFF}
+	resp, err = p.HandleRequest(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error on cached read: %v", err)
+	}
+	if !bytes.Equal(resp, expected) {
+		t.Fatalf("cached response: expected %v, got %v", expected, resp)
+	}
+	if upstream.calls != 1 {
+		t.Fatalf("expected cached read to avoid upstream call, got %d calls", upstream.calls)
+	}
+}
+
+func TestProxy_HandleReadServesStaleOnUpstreamError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := cache.New(10*time.Millisecond, true)
+	defer c.Close()
+
+	c.SetRange(1, modbus.FuncReadHoldingRegisters, 20, [][]byte{
+		{0x00, 0x01},
+		{0x00, 0x02},
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	upstreamErr := errors.New("upstream unavailable")
+	upstream := &mockClient{err: upstreamErr}
+	p := &Proxy{
+		cfg: &config.Config{
+			CacheTTL:        10 * time.Millisecond,
+			CacheServeStale: true,
+			ReadOnly:        config.ReadOnlyOn,
+		},
+		logger: logger,
+		client: upstream,
+		cache:  c,
+	}
+
+	req := &modbus.Request{
+		SlaveID:      1,
+		FunctionCode: modbus.FuncReadHoldingRegisters,
+		Address:      20,
+		Quantity:     2,
+	}
+
+	resp, err := p.HandleRequest(context.Background(), req)
+	if err != nil {
+		t.Fatalf("expected stale response, got error: %v", err)
+	}
+	if upstream.calls != 1 {
+		t.Fatalf("expected one failed upstream call before serving stale, got %d", upstream.calls)
+	}
+
+	expected := []byte{0x03, 0x04, 0x00, 0x01, 0x00, 0x02}
+	if !bytes.Equal(resp, expected) {
+		t.Fatalf("stale response: expected %v, got %v", expected, resp)
 	}
 }
 

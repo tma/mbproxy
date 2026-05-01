@@ -125,6 +125,18 @@ func TestCache_GetRange(t *testing.T) {
 	}
 }
 
+func TestCache_GetRangeZeroQuantityMiss(t *testing.T) {
+	c := New(time.Second, false)
+	defer c.Close()
+
+	if _, ok := c.GetRange(1, 0x03, 10, 0); ok {
+		t.Error("expected zero-quantity range to miss")
+	}
+	if _, ok := c.GetRangeStale(1, 0x03, 10, 0); ok {
+		t.Error("expected zero-quantity stale range to miss")
+	}
+}
+
 func TestCache_SetRange(t *testing.T) {
 	c := New(time.Second, false)
 	defer c.Close()

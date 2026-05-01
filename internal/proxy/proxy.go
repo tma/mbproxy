@@ -13,12 +13,18 @@ import (
 	"github.com/tma/mbproxy/internal/modbus"
 )
 
+type upstreamClient interface {
+	Connect() error
+	Close() error
+	Execute(context.Context, *modbus.Request) ([]byte, error)
+}
+
 // Proxy is a caching Modbus proxy server.
 type Proxy struct {
 	cfg    *config.Config
 	logger *slog.Logger
 	server *modbus.Server
-	client *modbus.Client
+	client upstreamClient
 	cache  *cache.Cache
 }
 
