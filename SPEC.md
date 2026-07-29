@@ -91,6 +91,34 @@ type CacheEntry struct {
 - Not reapplied between a failed read attempt and its retry
 - Logged at DEBUG level when a request waits for its slot
 
+### Request Diagnostics and Health
+
+- Structured upstream lifecycle logs include request identity (`slave_id`,
+  `func`, `addr`, `qty`, `write`), attempt state (`attempt`, `attempts`,
+  `will_retry`, `error_kind`), and disjoint timing
+  (`queue_duration`, `attempt_duration`, `reconnect_duration`,
+  `total_duration`). Write payloads are excluded.
+- A first retryable read transport failure is DEBUG; a successful retry is
+  DEBUG with `attempts=2`; a final upstream failure or genuine upstream Modbus
+  exception is WARN. Request cancellation is DEBUG. Requests already canceled
+  or expired do not select stale fallback, and the fallback record does not
+  claim downstream delivery. Genuine exceptions preserve their nonzero
+  `exception_code` and are not retried or reconnected.
+- Downstream failure logs include the mapped `downstream_exception`.
+  Coalesced followers use `coalesced=true`, expose their wait duration, and
+  report zero attempts instead of inheriting the leader's wire-attempt timing.
+  A follower that takes over after a canceled leader instead uses
+  `coalesced_waited=true` with `coalesced=false`; its wait is logged separately
+  and its replacement fetch keeps its actual upstream-attempt diagnostics.
+- Diagnostics retain cumulative retry and recovered-retry counters,
+  consecutive first-attempt and final-failure counts, last first-attempt
+  success, and last successful request.
+- A recovered retry sets diagnostic degradation immediately and that state is
+  cleared only by a later first-attempt success. It remains available and does
+  not fail health. If degradation persists for one minute, the health JSON
+  status becomes `degraded` while HTTP status remains 200. A final upstream
+  failure remains `unhealthy` with HTTP 503.
+
 ### 4. Read-Only Mode
 Three modes:
 - `false`: Full read/write passthrough
@@ -259,10 +287,10 @@ The cache also exposes `Coalesce(ctx, rangeKey, fetch)` for request coalescing. 
 level=INFO msg="starting proxy" listen=:5502 upstream=192.168.1.100:502
 level=DEBUG msg="cache hit" slave_id=1 func=0x03 addr=0 qty=10
 level=DEBUG msg="cache miss" slave_id=1 func=0x03 addr=0 qty=10
-level=DEBUG msg="upstream request completed" slave_id=1 func=0x03 addr=0 qty=10 duration=15ms
+level=DEBUG msg="upstream request completed" slave_id=1 func=0x03 addr=0 qty=10 write=false attempt=1 attempts=1 queue_duration=2ms attempt_duration=15ms reconnect_duration=0s total_duration=17ms error_kind="" will_retry=false
 level=DEBUG msg="waiting for upstream request slot" delay=100ms
 level=DEBUG msg="applying connect delay" delay=500ms
-level=WARN msg="upstream error, serving stale" slave_id=1 error="timeout"
+level=WARN msg="stale fallback selected" slave_id=1 stale_fallback_selected=true error_kind=transport_timeout
 level=INFO msg="shutting down"
 ```
 

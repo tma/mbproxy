@@ -18,8 +18,9 @@ type Checker interface {
 
 // Response is the JSON body returned by the health endpoint.
 type Response struct {
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+	Status  string         `json:"status"`
+	Error   string         `json:"error,omitempty"`
+	Details map[string]any `json:"details,omitempty"`
 }
 
 // Server is a lightweight HTTP server that exposes a /health endpoint.
@@ -50,9 +51,10 @@ func (s *Server) handleHealth(checker Checker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		if err := checker.Healthy(); err != nil {
+		status, details, healthErr := healthReport(checker)
+		if healthErr != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			resp := Response{Status: "unhealthy", Error: err.Error()}
+			resp := Response{Status: "unhealthy", Error: healthErr.Error(), Details: details}
 			if encErr := json.NewEncoder(w).Encode(resp); encErr != nil {
 				s.logger.Error("failed to encode health response", "error", encErr)
 			}
@@ -60,11 +62,28 @@ func (s *Server) handleHealth(checker Checker) http.HandlerFunc {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		resp := Response{Status: "ok"}
+		resp := Response{Status: status, Details: details}
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			s.logger.Error("failed to encode health response", "error", err)
 		}
 	}
+}
+
+func healthReport(checker Checker) (string, map[string]any, error) {
+	if reporter, ok := checker.(interface {
+		HealthReport() (string, map[string]any, error)
+	}); ok {
+		return reporter.HealthReport()
+	}
+
+	status := "ok"
+	var details map[string]any
+	if reporter, ok := checker.(interface {
+		HealthStatus() (string, map[string]any)
+	}); ok {
+		status, details = reporter.HealthStatus()
+	}
+	return status, details, checker.Healthy()
 }
 
 // ListenAndServe starts the health server. It blocks until the server

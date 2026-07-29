@@ -43,6 +43,43 @@ type inflightRequest struct {
 	followers int
 }
 
+// CoalesceResult describes whether a caller shared another caller's fetch.
+type CoalesceResult struct {
+	Coalesced    bool
+	Waited       bool
+	WaitDuration time.Duration
+}
+
+type coalescingError struct {
+	err          error
+	coalesced    bool
+	waitDuration time.Duration
+}
+
+func (e *coalescingError) Error() string {
+	return e.err.Error()
+}
+
+func (e *coalescingError) Unwrap() error {
+	return e.err
+}
+
+func (e *coalescingError) Coalesced() bool {
+	return e.coalesced
+}
+
+func (e *coalescingError) CoalescedWaitDuration() time.Duration {
+	return e.waitDuration
+}
+
+func attributedCoalescingError(err error, coalesced bool, waitDuration time.Duration) error {
+	return &coalescingError{
+		err:          err,
+		coalesced:    coalesced,
+		waitDuration: waitDuration,
+	}
+}
+
 // New creates a new cache with the specified default TTL.
 // If keepStale is true, expired entries are retained for stale serving.
 func New(defaultTTL time.Duration, keepStale bool) *Cache {
@@ -213,9 +250,20 @@ func (c *Cache) DeleteRange(slaveID byte, functionCode byte, startAddr uint16, q
 // Other callers with the same key wait for and share the first caller's result.
 // This handles request coalescing only — it does not interact with cache storage.
 func (c *Cache) Coalesce(ctx context.Context, key string, fetch func(context.Context) ([]byte, error)) ([]byte, error) {
+	data, _, err := c.CoalesceWithStatus(ctx, key, fetch)
+	return data, err
+}
+
+// CoalesceWithStatus is Coalesce with explicit leader/follower attribution.
+func (c *Cache) CoalesceWithStatus(ctx context.Context, key string, fetch func(context.Context) ([]byte, error)) ([]byte, CoalesceResult, error) {
+	var totalWait time.Duration
+	waited := false
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			if waited {
+				err = attributedCoalescingError(err, false, totalWait)
+			}
+			return nil, CoalesceResult{Waited: waited, WaitDuration: totalWait}, err
 		}
 
 		c.inflightMu.Lock()
@@ -229,25 +277,35 @@ func (c *Cache) Coalesce(ctx context.Context, key string, fetch func(context.Con
 		c.inflightMu.Unlock()
 
 		if ok {
+			waited = true
+			waitStart := time.Now()
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				waitDuration := time.Since(waitStart)
+				totalWait += waitDuration
+				return nil, CoalesceResult{Coalesced: true, Waited: true, WaitDuration: totalWait},
+					attributedCoalescingError(err, true, totalWait)
 			}
 			select {
 			case <-req.done:
+				totalWait += time.Since(waitStart)
 				if err := ctx.Err(); err != nil {
-					return nil, err
+					return nil, CoalesceResult{Coalesced: true, Waited: true, WaitDuration: totalWait},
+						attributedCoalescingError(err, true, totalWait)
 				}
 				if req.err != nil {
 					if errors.Is(req.err, context.Canceled) || errors.Is(req.err, context.DeadlineExceeded) {
 						continue
 					}
-					return nil, req.err
+					return nil, CoalesceResult{Coalesced: true, Waited: true, WaitDuration: totalWait},
+						attributedCoalescingError(req.err, true, totalWait)
 				}
 				data := make([]byte, len(req.result))
 				copy(data, req.result)
-				return data, nil
+				return data, CoalesceResult{Coalesced: true, Waited: true, WaitDuration: totalWait}, nil
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				totalWait += time.Since(waitStart)
+				return nil, CoalesceResult{Coalesced: true, Waited: true, WaitDuration: totalWait},
+					attributedCoalescingError(ctx.Err(), true, totalWait)
 			}
 		}
 
@@ -265,12 +323,15 @@ func (c *Cache) Coalesce(ctx context.Context, key string, fetch func(context.Con
 		close(req.done)
 
 		if err != nil {
-			return nil, err
+			if waited {
+				err = attributedCoalescingError(err, false, totalWait)
+			}
+			return nil, CoalesceResult{Waited: waited, WaitDuration: totalWait}, err
 		}
 
 		result := make([]byte, len(data))
 		copy(result, data)
-		return result, nil
+		return result, CoalesceResult{Waited: waited, WaitDuration: totalWait}, nil
 	}
 }
 

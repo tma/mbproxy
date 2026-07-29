@@ -303,6 +303,93 @@ func TestCache_CoalescingConcurrent(t *testing.T) {
 	}
 }
 
+func TestCache_CoalesceWithStatusAttributesFollowers(t *testing.T) {
+	tests := []struct {
+		name      string
+		leaderErr error
+	}{
+		{name: "success"},
+		{name: "error", leaderErr: errors.New("upstream failed")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := New(time.Second, false)
+			defer c.Close()
+			started := make(chan struct{})
+			release := make(chan struct{})
+			leaderDone := make(chan error, 1)
+			go func() {
+				_, status, err := c.CoalesceWithStatus(context.Background(), "key", func(context.Context) ([]byte, error) {
+					close(started)
+					<-release
+					return []byte("shared"), tt.leaderErr
+				})
+				if status.Coalesced {
+					leaderDone <- errors.New("leader reported as coalesced")
+					return
+				}
+				leaderDone <- err
+			}()
+			<-started
+
+			type outcome struct {
+				data   []byte
+				status CoalesceResult
+				err    error
+			}
+			followerDone := make(chan outcome, 1)
+			go func() {
+				data, status, err := c.CoalesceWithStatus(context.Background(), "key", func(context.Context) ([]byte, error) {
+					return nil, errors.New("follower fetch ran")
+				})
+				followerDone <- outcome{data: data, status: status, err: err}
+			}()
+
+			deadline := time.Now().Add(time.Second)
+			for {
+				c.inflightMu.Lock()
+				req := c.inflight["key"]
+				joined := req != nil && req.followers == 1
+				c.inflightMu.Unlock()
+				if joined {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("follower did not join leader")
+				}
+				runtime.Gosched()
+			}
+			close(release)
+
+			if err := <-leaderDone; !errors.Is(err, tt.leaderErr) {
+				t.Fatalf("leader error = %v, want %v", err, tt.leaderErr)
+			}
+			follower := <-followerDone
+			if !follower.status.Coalesced || follower.status.WaitDuration < 0 {
+				t.Fatalf("missing follower attribution: %+v", follower.status)
+			}
+			if tt.leaderErr == nil {
+				if follower.err != nil || string(follower.data) != "shared" {
+					t.Fatalf("unexpected follower success data=%q err=%v", follower.data, follower.err)
+				}
+				return
+			}
+			if !errors.Is(follower.err, tt.leaderErr) {
+				t.Fatalf("coalesced error lost cause: %v", follower.err)
+			}
+			var marker interface {
+				Coalesced() bool
+				CoalescedWaitDuration() time.Duration
+			}
+			if !errors.As(follower.err, &marker) ||
+				!marker.Coalesced() ||
+				marker.CoalescedWaitDuration() != follower.status.WaitDuration {
+				t.Fatalf("coalesced error lost attribution: status=%+v err=%v", follower.status, follower.err)
+			}
+		})
+	}
+}
+
 func TestCache_ContextCancellation(t *testing.T) {
 	c := New(time.Second, false)
 	defer c.Close()
@@ -376,10 +463,11 @@ func TestCache_LiveFollowerRetriesAfterLeaderDeadline(t *testing.T) {
 
 	followerDone := make(chan struct{})
 	var followerData []byte
+	var followerStatus CoalesceResult
 	var followerErr error
 	var followerFetches atomic.Int32
 	go func() {
-		followerData, followerErr = c.Coalesce(context.Background(), "key1", func(context.Context) ([]byte, error) {
+		followerData, followerStatus, followerErr = c.CoalesceWithStatus(context.Background(), "key1", func(context.Context) ([]byte, error) {
 			followerFetches.Add(1)
 			return []byte("fresh"), nil
 		})
@@ -415,6 +503,76 @@ func TestCache_LiveFollowerRetriesAfterLeaderDeadline(t *testing.T) {
 	}
 	if followerFetches.Load() != 1 {
 		t.Fatalf("follower fetch ran %d times", followerFetches.Load())
+	}
+	if !followerStatus.Waited || followerStatus.Coalesced || followerStatus.WaitDuration <= 0 {
+		t.Fatalf("replacement leader lost prior follower attribution: %+v", followerStatus)
+	}
+}
+
+func TestCache_ReplacementLeaderErrorPreservesWaitAttribution(t *testing.T) {
+	c := New(time.Second, false)
+	defer c.Close()
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderStarted := make(chan struct{})
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := c.Coalesce(leaderCtx, "key1", func(ctx context.Context) ([]byte, error) {
+			close(leaderStarted)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+		leaderDone <- err
+	}()
+	<-leaderStarted
+
+	replacementErr := errors.New("replacement failed")
+	type outcome struct {
+		status CoalesceResult
+		err    error
+	}
+	followerDone := make(chan outcome, 1)
+	go func() {
+		_, status, err := c.CoalesceWithStatus(context.Background(), "key1", func(context.Context) ([]byte, error) {
+			return nil, replacementErr
+		})
+		followerDone <- outcome{status: status, err: err}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.inflightMu.Lock()
+		req := c.inflight["key1"]
+		joined := req != nil && req.followers == 1
+		c.inflightMu.Unlock()
+		if joined {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("follower did not join leader")
+		}
+		runtime.Gosched()
+	}
+
+	cancelLeader()
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader error = %v, want cancellation", err)
+	}
+	follower := <-followerDone
+	if !errors.Is(follower.err, replacementErr) ||
+		!follower.status.Waited ||
+		follower.status.Coalesced ||
+		follower.status.WaitDuration <= 0 {
+		t.Fatalf("replacement result lost wait attribution: status=%+v err=%v", follower.status, follower.err)
+	}
+	var marker interface {
+		Coalesced() bool
+		CoalescedWaitDuration() time.Duration
+	}
+	if !errors.As(follower.err, &marker) ||
+		marker.Coalesced() ||
+		marker.CoalescedWaitDuration() != follower.status.WaitDuration {
+		t.Fatalf("replacement error lost wait attribution: status=%+v err=%v", follower.status, follower.err)
 	}
 }
 

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -20,6 +21,18 @@ type mockClient struct {
 	response []byte
 	err      error
 	calls    int
+}
+
+type healthReportingClient struct {
+	mockClient
+}
+
+func (c *healthReportingClient) HealthStatus() (string, map[string]any) {
+	return "degraded", map[string]any{"total_retries": uint64(2)}
+}
+
+func (c *healthReportingClient) HealthReport() (string, map[string]any, error) {
+	return "degraded", map[string]any{"total_retries": uint64(2)}, nil
 }
 
 type interleavingClient struct {
@@ -100,6 +113,125 @@ func (m *mockClient) Healthy() error { return nil }
 func (m *mockClient) Execute(ctx context.Context, req *modbus.Request) ([]byte, error) {
 	m.calls++
 	return m.response, m.err
+}
+
+func TestProxy_DelegatesHealthDiagnostics(t *testing.T) {
+	p := &Proxy{client: &healthReportingClient{}}
+	status, details := p.HealthStatus()
+	if status != "degraded" || details["total_retries"] != uint64(2) {
+		t.Fatalf("status=%q details=%+v", status, details)
+	}
+	status, details, err := p.HealthReport()
+	if err != nil || status != "degraded" || details["total_retries"] != uint64(2) {
+		t.Fatalf("atomic status=%q details=%+v err=%v", status, details, err)
+	}
+}
+
+func TestProxy_CoalescedCompletionLogsFollowerAttribution(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	p := &Proxy{logger: logger}
+	req := &modbus.Request{
+		SlaveID:      3,
+		FunctionCode: modbus.FuncReadHoldingRegisters,
+		Address:      120,
+		Quantity:     4,
+	}
+
+	p.logCoalescedCompletion(req, cache.CoalesceResult{
+		Coalesced:    true,
+		Waited:       true,
+		WaitDuration: 5 * time.Second,
+	})
+
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &entry); err != nil {
+		t.Fatalf("decode log: %v", err)
+	}
+	for _, field := range []string{
+		"slave_id", "func", "addr", "qty", "write", "attempt", "attempts",
+		"queue_duration", "attempt_duration", "reconnect_duration",
+		"total_duration", "error_kind", "will_retry", "coalesced",
+		"coalesced_wait_duration",
+	} {
+		if _, ok := entry[field]; !ok {
+			t.Errorf("log entry missing %q: %+v", field, entry)
+		}
+	}
+	if entry["attempts"] != float64(0) ||
+		entry["attempt_duration"] != float64(0) ||
+		entry["reconnect_duration"] != float64(0) ||
+		entry["coalesced"] != true ||
+		entry["queue_duration"] != float64(5*time.Second) {
+		t.Fatalf("coalesced follower claimed an upstream attempt: %+v", entry)
+	}
+}
+
+func TestProxy_CoalescedFailureLogsWaitWithoutAttempt(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	p := &Proxy{logger: logger}
+	req := &modbus.Request{
+		SlaveID:      3,
+		FunctionCode: modbus.FuncReadHoldingRegisters,
+		Address:      120,
+		Quantity:     4,
+	}
+	err := &modbus.RequestError{
+		Kind:     modbus.ErrorTransportTimeout,
+		Attempts: 2,
+		Err:      context.DeadlineExceeded,
+	}
+
+	p.logCoalescedFailure(req, cache.CoalesceResult{
+		Coalesced:    true,
+		Waited:       true,
+		WaitDuration: 5 * time.Second,
+	}, err, false)
+
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &entry); err != nil {
+		t.Fatalf("decode log: %v", err)
+	}
+	if entry["attempts"] != float64(0) ||
+		entry["attempt_duration"] != float64(0) ||
+		entry["reconnect_duration"] != float64(0) ||
+		entry["coalesced"] != true ||
+		entry["error_kind"] != string(modbus.ErrorTransportTimeout) ||
+		entry["stale_fallback_selected"] != false ||
+		entry["downstream_exception"] != "0x0B" {
+		t.Fatalf("coalesced failure claimed leader diagnostics: %+v", entry)
+	}
+}
+
+func TestProxy_ReplacementLeaderLogsPriorCoalescingWait(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	p := &Proxy{logger: logger}
+	req := &modbus.Request{
+		SlaveID:      3,
+		FunctionCode: modbus.FuncReadHoldingRegisters,
+		Address:      120,
+		Quantity:     4,
+	}
+
+	p.logCoalescingWait(req, cache.CoalesceResult{
+		Waited:       true,
+		WaitDuration: 5 * time.Second,
+	}, nil)
+
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &entry); err != nil {
+		t.Fatalf("decode log: %v", err)
+	}
+	if entry["coalesced"] != false ||
+		entry["coalesced_waited"] != true ||
+		entry["coalesced_wait_duration"] != float64(5*time.Second) {
+		t.Fatalf("replacement leader lost wait attribution: %+v", entry)
+	}
+	if _, ok := entry["attempts"]; ok {
+		t.Fatalf("wait-only event claimed an upstream attempt: %+v", entry)
+	}
 }
 
 func TestProxy_HandleReadCacheHit(t *testing.T) {
@@ -210,7 +342,8 @@ func TestProxy_HandleReadMissFetchesAndCaches(t *testing.T) {
 }
 
 func TestProxy_HandleReadServesStaleOnUpstreamError(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	c := cache.New(10*time.Millisecond, true)
 	defer c.Close()
 
@@ -251,6 +384,79 @@ func TestProxy_HandleReadServesStaleOnUpstreamError(t *testing.T) {
 	expected := []byte{0x03, 0x04, 0x00, 0x01, 0x00, 0x02}
 	if !bytes.Equal(resp, expected) {
 		t.Fatalf("stale response: expected %v, got %v", expected, resp)
+	}
+	var entry map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(output.Bytes()), []byte{'\n'}) {
+		var candidate map[string]any
+		if err := json.Unmarshal(line, &candidate); err != nil {
+			t.Fatalf("decode stale fallback log: %v", err)
+		}
+		if candidate["msg"] == "stale fallback selected" {
+			entry = candidate
+			break
+		}
+	}
+	if entry == nil || entry["stale_fallback_selected"] != true {
+		t.Fatalf("stale fallback selection not logged accurately: %+v", entry)
+	}
+}
+
+func TestProxy_HandleReadDoesNotServeStaleAfterContextEnds(t *testing.T) {
+	tests := []struct {
+		name    string
+		context func() (context.Context, context.CancelFunc)
+		wantErr error
+	}{
+		{
+			name: "canceled",
+			context: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "deadline",
+			context: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			c := cache.New(time.Nanosecond, true)
+			defer c.Close()
+			c.SetRange(1, modbus.FuncReadHoldingRegisters, 20, [][]byte{{0x00, 0x01}})
+			time.Sleep(time.Millisecond)
+			p := &Proxy{
+				cfg: &config.Config{
+					CacheServeStale: true,
+					ReadOnly:        config.ReadOnlyOn,
+				},
+				logger: logger,
+				client: &mockClient{err: errors.New("upstream unavailable")},
+				cache:  c,
+			}
+			req := &modbus.Request{
+				SlaveID:      1,
+				FunctionCode: modbus.FuncReadHoldingRegisters,
+				Address:      20,
+				Quantity:     1,
+			}
+			ctx, cancel := tt.context()
+			defer cancel()
+
+			if _, err := p.HandleRequest(ctx, req); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+			if bytes.Contains(output.Bytes(), []byte("stale fallback selected")) {
+				t.Fatalf("context-ended request selected stale fallback: %s", output.String())
+			}
+		})
 	}
 }
 

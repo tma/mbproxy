@@ -69,6 +69,29 @@ func (p *Proxy) Healthy() error {
 	return p.client.Healthy()
 }
 
+// HealthStatus returns optional upstream reliability diagnostics.
+func (p *Proxy) HealthStatus() (string, map[string]any) {
+	reporter, ok := p.client.(interface {
+		HealthStatus() (string, map[string]any)
+	})
+	if !ok {
+		return "ok", nil
+	}
+	return reporter.HealthStatus()
+}
+
+// HealthReport returns reliability diagnostics and availability from one snapshot.
+func (p *Proxy) HealthReport() (string, map[string]any, error) {
+	reporter, ok := p.client.(interface {
+		HealthReport() (string, map[string]any, error)
+	})
+	if ok {
+		return reporter.HealthReport()
+	}
+	status, details := p.HealthStatus()
+	return status, details, p.Healthy()
+}
+
 // Run starts the proxy server.
 func (p *Proxy) Run(ctx context.Context) error {
 	p.logger.Info("starting proxy",
@@ -164,7 +187,7 @@ func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, er
 	)
 
 	rangeKey := fmt.Sprintf("%d:%s", generation, cache.RangeKey(req.SlaveID, req.FunctionCode, req.Address, req.Quantity))
-	data, err := p.cache.Coalesce(ctx, rangeKey, func(ctx context.Context) ([]byte, error) {
+	data, coalesced, err := p.cache.CoalesceWithStatus(ctx, rangeKey, func(ctx context.Context) ([]byte, error) {
 		data, err := p.client.Execute(ctx, req)
 		if err != nil {
 			return nil, err
@@ -182,22 +205,122 @@ func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, er
 
 	if err != nil {
 		// Try serving stale data if configured
-		if p.cfg.CacheServeStale && modbus.ErrorKindOf(err) != modbus.ErrorProtocolException {
+		if p.cfg.CacheServeStale &&
+			modbus.ErrorKindOf(err) != modbus.ErrorProtocolException &&
+			requestContextActive(ctx) {
 			p.cacheStateMu.Lock()
 			staleValues, ok := p.cache.GetRangeStale(req.SlaveID, req.FunctionCode, req.Address, req.Quantity)
 			p.cacheStateMu.Unlock()
 			if ok {
-				p.logger.Warn("upstream error, serving stale",
+				if coalesced.Coalesced {
+					p.logCoalescedFailure(req, coalesced, err, true)
+				} else if coalesced.Waited {
+					p.logCoalescingWait(req, coalesced, err)
+				}
+				p.logger.Warn("stale fallback selected",
 					"slave_id", req.SlaveID,
+					"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+					"addr", req.Address,
+					"qty", req.Quantity,
+					"write", false,
+					"coalesced", coalesced.Coalesced,
+					"coalesced_waited", coalesced.Waited,
+					"coalesced_wait_duration", coalesced.WaitDuration,
+					"stale_fallback_selected", true,
+					"error_kind", modbus.ErrorKindOf(err),
 					"error", err,
 				)
 				return assembleResponse(req.FunctionCode, req.Quantity, staleValues), nil
 			}
 		}
+		if coalesced.Coalesced {
+			p.logCoalescedFailure(req, coalesced, err, false)
+		} else if coalesced.Waited {
+			p.logCoalescingWait(req, coalesced, err)
+		}
 		return nil, err
 	}
 
+	if coalesced.Coalesced {
+		p.logCoalescedCompletion(req, coalesced)
+	} else if coalesced.Waited {
+		p.logCoalescingWait(req, coalesced, nil)
+	}
+
 	return data, nil
+}
+
+func requestContextActive(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	deadline, ok := ctx.Deadline()
+	return !ok || time.Now().Before(deadline)
+}
+
+func (p *Proxy) logCoalescedCompletion(req *modbus.Request, result cache.CoalesceResult) {
+	p.logger.Debug("coalesced request completed",
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+		"addr", req.Address,
+		"qty", req.Quantity,
+		"write", false,
+		"attempt", 0,
+		"attempts", 0,
+		"queue_duration", result.WaitDuration,
+		"attempt_duration", time.Duration(0),
+		"reconnect_duration", time.Duration(0),
+		"total_duration", result.WaitDuration,
+		"error_kind", "",
+		"will_retry", false,
+		"coalesced", true,
+		"coalesced_waited", true,
+		"coalesced_wait_duration", result.WaitDuration,
+	)
+}
+
+func (p *Proxy) logCoalescedFailure(req *modbus.Request, result cache.CoalesceResult, err error, staleFallbackSelected bool) {
+	args := []any{
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+		"addr", req.Address,
+		"qty", req.Quantity,
+		"write", false,
+		"attempt", 0,
+		"attempts", 0,
+		"queue_duration", result.WaitDuration,
+		"attempt_duration", time.Duration(0),
+		"reconnect_duration", time.Duration(0),
+		"total_duration", result.WaitDuration,
+		"error_kind", modbus.ErrorKindOf(err),
+		"will_retry", false,
+		"coalesced", true,
+		"coalesced_waited", true,
+		"coalesced_wait_duration", result.WaitDuration,
+		"stale_fallback_selected", staleFallbackSelected,
+		"error", err,
+	}
+	if !staleFallbackSelected {
+		args = append(args, "downstream_exception", fmt.Sprintf("0x%02X", modbus.DownstreamException(err)))
+	}
+	p.logger.Debug("coalesced request failed", args...)
+}
+
+func (p *Proxy) logCoalescingWait(req *modbus.Request, result cache.CoalesceResult, err error) {
+	args := []any{
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+		"addr", req.Address,
+		"qty", req.Quantity,
+		"write", false,
+		"coalesced", false,
+		"coalesced_waited", true,
+		"coalesced_wait_duration", result.WaitDuration,
+	}
+	if err != nil {
+		args = append(args, "error_kind", modbus.ErrorKindOf(err), "error", err)
+	}
+	p.logger.Debug("coalescing wait ended before replacement fetch", args...)
 }
 
 func (p *Proxy) handleWrite(ctx context.Context, req *modbus.Request) ([]byte, error) {

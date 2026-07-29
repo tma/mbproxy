@@ -9,6 +9,7 @@ A lightweight Modbus TCP proxy with in-memory caching. Designed to reduce load o
 - **Read-only mode**: Optionally block or ignore write requests
 - **Auto-reconnect**: Automatic upstream reconnection on failure
 - **Stale data fallback**: Optionally serve stale cache on upstream errors
+- **Request diagnostics**: Structured lifecycle timing, retry, exception, and health state
 - **Graceful shutdown**: Complete in-flight requests before terminating
 - **Minimal footprint**: ~6MB Docker image (scratch base)
 
@@ -56,6 +57,35 @@ failures and total request deadlines map to gateway target failed to respond
 validation uses the standard validation exception codes.
 
 `/mbproxy -health` performs an internal upstream connectivity check and does not open a separate local TCP health port.
+
+### Production Diagnostics
+
+Upstream lifecycle logs identify requests with `slave_id`, `func`, `addr`,
+`qty`, and `write`; write payloads are never logged. Timing fields separate
+`queue_duration`, `attempt_duration`, `reconnect_duration`, and
+`total_duration`. Retry and failure records also include `attempt`, `attempts`,
+`error_kind`, `will_retry`, and the preserved `exception_code` or mapped
+`downstream_exception` when applicable.
+
+The first retryable read transport failure is logged at DEBUG with
+`will_retry=true`; a recovered second attempt is logged at DEBUG with
+`attempts=2`. Final upstream failures and genuine upstream Modbus exceptions
+are WARN records. Request cancellation is DEBUG. Requests already canceled or
+expired do not select stale fallback, and the fallback record does not claim
+downstream delivery. Coalesced followers report `coalesced=true`,
+`coalesced_wait_duration`, and zero attempts so they are not mistaken for
+independent upstream traffic. A follower that outlives a canceled leader and
+performs the replacement fetch instead reports `coalesced_waited=true` with
+`coalesced=false`, preserving both its wait and its real upstream attempt.
+
+The health response includes cumulative `total_retries` and
+`recovered_retries`, consecutive first-attempt and final-failure counts, the
+last first-attempt success, the last successful request, and degradation flags.
+A recovered retry immediately sets `degraded=true` but remains HTTP 200 with
+status `ok`. If no first-attempt success clears that state for one minute,
+status becomes `degraded` while remaining HTTP 200. A final upstream failure
+still returns HTTP 503 `unhealthy`. Success timestamps are `null` until the
+corresponding success has occurred.
 
 ### Read-Only Modes
 

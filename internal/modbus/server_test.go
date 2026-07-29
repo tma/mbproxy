@@ -1,8 +1,10 @@
 package modbus
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -16,6 +18,28 @@ import (
 type mockHandler struct {
 	response []byte
 	err      error
+}
+
+type testCoalescedError struct {
+	err       error
+	coalesced bool
+	wait      time.Duration
+}
+
+func (e *testCoalescedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *testCoalescedError) Unwrap() error {
+	return e.err
+}
+
+func (e *testCoalescedError) Coalesced() bool {
+	return e.coalesced
+}
+
+func (e *testCoalescedError) CoalescedWaitDuration() time.Duration {
+	return e.wait
 }
 
 func (h *mockHandler) HandleRequest(ctx context.Context, req *Request) ([]byte, error) {
@@ -172,6 +196,200 @@ func TestServer_PreservesUpstreamException(t *testing.T) {
 	resp := executeServerRequest(t, handler, time.Second)
 	if resp[7] != FuncReadHoldingRegisters|0x80 || resp[8] != ExcIllegalAddress {
 		t.Fatalf("unexpected exception response: % x", resp[7:9])
+	}
+}
+
+func TestServer_CoalescedFailureDoesNotClaimLeaderAttempts(t *testing.T) {
+	output, logger := newDiagnosticLogger()
+	server := NewServer(nil, time.Second, logger)
+	req := &Request{
+		SlaveID:      9,
+		FunctionCode: FuncReadHoldingRegisters,
+		Address:      400,
+		Quantity:     2,
+	}
+	err := &testCoalescedError{
+		err: &RequestError{
+			Kind:              ErrorTransportTimeout,
+			Attempts:          2,
+			QueueDuration:     time.Second,
+			AttemptDuration:   2 * time.Second,
+			ReconnectDuration: 3 * time.Second,
+			TotalDuration:     6 * time.Second,
+			Err:               fakeTimeoutError{},
+		},
+		coalesced: true,
+		wait:      4 * time.Second,
+	}
+
+	server.logHandlerError(req, err, ExcGatewayTargetFailed, 5*time.Second)
+
+	entry := findLogEntry(t, output, "request failed")
+	requireLifecycleFields(t, entry)
+	if entry["level"] != "WARN" ||
+		entry["attempts"] != float64(0) ||
+		entry["attempt_duration"] != float64(0) ||
+		entry["reconnect_duration"] != float64(0) ||
+		entry["coalesced"] != true ||
+		entry["coalesced_waited"] != true ||
+		entry["downstream_exception"] != "0x0B" {
+		t.Fatalf("coalesced follower claimed leader diagnostics: %+v", entry)
+	}
+	requireDurationField(t, entry, "queue_duration", 4*time.Second)
+	requireDurationField(t, entry, "coalesced_wait_duration", 4*time.Second)
+	requireDurationField(t, entry, "total_duration", 5*time.Second)
+}
+
+func TestServer_ReplacementLeaderFailureIncludesWaitAndAttempts(t *testing.T) {
+	output, logger := newDiagnosticLogger()
+	server := NewServer(nil, time.Second, logger)
+	req := &Request{
+		SlaveID:      9,
+		FunctionCode: FuncReadHoldingRegisters,
+		Address:      400,
+		Quantity:     2,
+	}
+	err := &testCoalescedError{
+		err: &RequestError{
+			Kind:              ErrorTransportTimeout,
+			Attempts:          2,
+			QueueDuration:     time.Second,
+			AttemptDuration:   2 * time.Second,
+			ReconnectDuration: 3 * time.Second,
+			TotalDuration:     6 * time.Second,
+			Err:               fakeTimeoutError{},
+		},
+		wait: 4 * time.Second,
+	}
+
+	server.logHandlerError(req, err, ExcGatewayTargetFailed, 10*time.Second)
+
+	entry := findLogEntry(t, output, "request failed")
+	if entry["level"] != "WARN" ||
+		entry["attempts"] != float64(2) ||
+		entry["coalesced"] != false ||
+		entry["coalesced_waited"] != true {
+		t.Fatalf("replacement leader attribution missing: %+v", entry)
+	}
+	requireDurationField(t, entry, "queue_duration", 5*time.Second)
+	requireDurationField(t, entry, "attempt_duration", 2*time.Second)
+	requireDurationField(t, entry, "reconnect_duration", 3*time.Second)
+	requireDurationField(t, entry, "total_duration", 10*time.Second)
+}
+
+func TestServer_FinalFailureWarnHasCompleteDiagnostics(t *testing.T) {
+	output, logger := newDiagnosticLogger()
+	server := NewServer(nil, time.Second, logger)
+	req := &Request{
+		SlaveID:      9,
+		FunctionCode: FuncReadHoldingRegisters,
+		Address:      400,
+		Quantity:     2,
+	}
+	err := &RequestError{
+		Kind:              ErrorTransportTimeout,
+		Attempts:          2,
+		QueueDuration:     time.Second,
+		AttemptDuration:   2 * time.Second,
+		ReconnectDuration: 3 * time.Second,
+		TotalDuration:     6 * time.Second,
+		Err:               fakeTimeoutError{},
+	}
+
+	server.logHandlerError(req, err, ExcGatewayTargetFailed, 7*time.Second)
+
+	entry := findLogEntry(t, output, "request failed")
+	requireLifecycleFields(t, entry)
+	if entry["level"] != "WARN" ||
+		entry["attempts"] != float64(2) ||
+		entry["error_kind"] != string(ErrorTransportTimeout) ||
+		entry["downstream_exception"] != "0x0B" ||
+		entry["will_retry"] != false {
+		t.Fatalf("unexpected final failure log: %+v", entry)
+	}
+	requireDurationField(t, entry, "queue_duration", time.Second)
+	requireDurationField(t, entry, "attempt_duration", 2*time.Second)
+	requireDurationField(t, entry, "reconnect_duration", 3*time.Second)
+	requireDurationField(t, entry, "total_duration", 7*time.Second)
+}
+
+func TestServer_ProtocolExceptionWarnPreservesCode(t *testing.T) {
+	output, logger := newDiagnosticLogger()
+	server := NewServer(nil, time.Second, logger)
+	req := &Request{
+		SlaveID:      9,
+		FunctionCode: FuncReadHoldingRegisters,
+		Address:      400,
+		Quantity:     2,
+	}
+	err := &RequestError{
+		Kind:          ErrorProtocolException,
+		ExceptionCode: ExcIllegalAddress,
+		Attempts:      1,
+		Err: &gridmodbus.Error{
+			FunctionCode:  FuncReadHoldingRegisters | 0x80,
+			ExceptionCode: ExcIllegalAddress,
+		},
+	}
+
+	server.logHandlerError(req, err, ExcIllegalAddress, time.Second)
+
+	entry := findLogEntry(t, output, "request failed")
+	requireLifecycleFields(t, entry)
+	if entry["level"] != "WARN" ||
+		entry["attempts"] != float64(1) ||
+		entry["error_kind"] != string(ErrorProtocolException) ||
+		entry["exception_code"] != "0x02" ||
+		entry["downstream_exception"] != "0x02" {
+		t.Fatalf("unexpected protocol exception log: %+v", entry)
+	}
+}
+
+func TestServer_ContextCancellationIsDebug(t *testing.T) {
+	output, logger := newDiagnosticLogger()
+	server := NewServer(nil, time.Second, logger)
+	req := &Request{
+		SlaveID:      9,
+		FunctionCode: FuncReadHoldingRegisters,
+		Address:      400,
+		Quantity:     2,
+	}
+
+	server.logHandlerError(req, context.Canceled, ExcGatewayTargetFailed, time.Second)
+
+	entry := findLogEntry(t, output, "request canceled")
+	requireLifecycleFields(t, entry)
+	if entry["level"] != "DEBUG" || entry["error_kind"] != string(ErrorContextCanceled) {
+		t.Fatalf("unexpected cancellation log: %+v", entry)
+	}
+}
+
+func TestServer_WriteFailureDoesNotLogRawError(t *testing.T) {
+	const payload = "sensitivepayload1234"
+	output, logger := newDiagnosticLogger()
+	server := NewServer(nil, time.Second, logger)
+	req := &Request{
+		SlaveID:      9,
+		FunctionCode: FuncWriteMultipleRegs,
+		Address:      400,
+		Quantity:     10,
+		Data:         []byte(payload),
+	}
+	err := &RequestError{
+		Kind:     ErrorTransportClosed,
+		Attempts: 1,
+		Err:      errors.New(payload),
+	}
+
+	server.logHandlerError(req, err, ExcGatewayTargetFailed, time.Second)
+
+	if bytes.Contains(output.Bytes(), []byte(payload)) {
+		t.Fatalf("write payload leaked through raw error: %s", output.String())
+	}
+	entry := findLogEntry(t, output, "request failed")
+	requireLifecycleFields(t, entry)
+	if _, ok := entry["error"]; ok {
+		t.Fatalf("write failure retained raw error: %+v", entry)
 	}
 }
 

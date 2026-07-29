@@ -1,8 +1,10 @@
 package modbus
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -118,6 +120,7 @@ func (c *fakeSession) BeginRequest(ctx context.Context, _ time.Duration) func() 
 type fakeSessionSet struct {
 	client      *fakeRequestClient
 	connectErrs []error
+	connectHook func(context.Context)
 	sessions    atomic.Int32
 	connects    atomic.Int32
 	closes      atomic.Int32
@@ -130,7 +133,13 @@ func (s *fakeSessionSet) factory() (clientSession, requestClient) {
 	if index < len(s.connectErrs) {
 		err = s.connectErrs[index]
 	}
-	return &fakeSession{connectErr: err, finishErr: s.finishErr, connects: &s.connects, closes: &s.closes}, s.client
+	return &fakeSession{
+		connectErr:  err,
+		connectHook: s.connectHook,
+		finishErr:   s.finishErr,
+		connects:    &s.connects,
+		closes:      &s.closes,
+	}, s.client
 }
 
 func newFakeClient(results []fakeResult) (*Client, *fakeSessionSet) {
@@ -152,6 +161,68 @@ func writeRequest() *Request {
 		Address:      10,
 		Quantity:     1,
 		Data:         []byte{0, 1},
+	}
+}
+
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(duration)
+	c.mu.Unlock()
+}
+
+func newDiagnosticLogger() (*bytes.Buffer, *slog.Logger) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return &output, logger
+}
+
+func findLogEntry(t *testing.T, output *bytes.Buffer, message string) map[string]any {
+	t.Helper()
+	for _, line := range bytes.Split(bytes.TrimSpace(output.Bytes()), []byte{'\n'}) {
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("decode log entry: %v", err)
+		}
+		if entry["msg"] == message {
+			return entry
+		}
+	}
+	t.Fatalf("log message %q not found in %s", message, output.String())
+	return nil
+}
+
+func requireLifecycleFields(t *testing.T, entry map[string]any) {
+	t.Helper()
+	for _, field := range []string{
+		"slave_id", "func", "addr", "qty", "write", "attempt", "attempts",
+		"queue_duration", "attempt_duration", "reconnect_duration",
+		"total_duration", "error_kind", "will_retry",
+	} {
+		if _, ok := entry[field]; !ok {
+			t.Errorf("log entry missing %q: %+v", field, entry)
+		}
+	}
+}
+
+func requireDurationField(t *testing.T, entry map[string]any, field string, want time.Duration) {
+	t.Helper()
+	value, ok := entry[field].(float64)
+	if !ok {
+		t.Fatalf("%s has type %T, want JSON number", field, entry[field])
+	}
+	if got := time.Duration(value); got != want {
+		t.Fatalf("%s = %v, want %v", field, got, want)
 	}
 }
 
@@ -256,6 +327,221 @@ func TestClient_WriteTimeoutIsNotRetried(t *testing.T) {
 	}
 }
 
+func TestClient_RetryDiagnosticsSeparateTiming(t *testing.T) {
+	clock := &testClock{
+		now: time.Unix(1000, 0),
+	}
+	queueStarted := make(chan struct{})
+	output, logger := newDiagnosticLogger()
+	client, sessions := newFakeClient([]fakeResult{
+		{err: fakeTimeoutError{}, complete: func() { clock.Advance(3 * time.Second) }},
+		{data: []byte{0x12, 0x34}, complete: func() { clock.Advance(3 * time.Second) }},
+	})
+	client.logger = logger
+	client.now = clock.Now
+	client.beforeAcquire = func() { close(queueStarted) }
+	sessions.connectHook = func(context.Context) { clock.Advance(2 * time.Second) }
+
+	<-client.owner
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.Execute(context.Background(), readRequest())
+		result <- err
+	}()
+	<-queueStarted
+	clock.Advance(time.Second)
+	client.release()
+	if err := <-result; err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	firstFailure := findLogEntry(t, output, "upstream request attempt failed")
+	requireLifecycleFields(t, firstFailure)
+	if firstFailure["level"] != "DEBUG" ||
+		firstFailure["attempts"] != float64(1) ||
+		firstFailure["error_kind"] != string(ErrorTransportTimeout) ||
+		firstFailure["will_retry"] != true {
+		t.Fatalf("unexpected first failure log: %+v", firstFailure)
+	}
+	requireDurationField(t, firstFailure, "queue_duration", time.Second)
+	requireDurationField(t, firstFailure, "attempt_duration", 3*time.Second)
+	requireDurationField(t, firstFailure, "reconnect_duration", 2*time.Second)
+	requireDurationField(t, firstFailure, "total_duration", 6*time.Second)
+
+	recovered := findLogEntry(t, output, "upstream request completed")
+	requireLifecycleFields(t, recovered)
+	if recovered["level"] != "DEBUG" ||
+		recovered["attempts"] != float64(2) ||
+		recovered["error_kind"] != "" ||
+		recovered["will_retry"] != false {
+		t.Fatalf("unexpected recovered retry log: %+v", recovered)
+	}
+	requireDurationField(t, recovered, "queue_duration", time.Second)
+	requireDurationField(t, recovered, "attempt_duration", 6*time.Second)
+	requireDurationField(t, recovered, "reconnect_duration", 4*time.Second)
+	requireDurationField(t, recovered, "total_duration", 11*time.Second)
+}
+
+func TestClient_FinalFailureLogHasCompleteClassification(t *testing.T) {
+	output, logger := newDiagnosticLogger()
+	client, _ := newFakeClient([]fakeResult{
+		{err: fakeTimeoutError{}},
+		{err: fakeTimeoutError{}},
+	})
+	client.logger = logger
+
+	_, err := client.Execute(t.Context(), readRequest())
+	if err == nil {
+		t.Fatal("expected final failure")
+	}
+	entry := findLogEntry(t, output, "upstream request failed")
+	requireLifecycleFields(t, entry)
+	if entry["level"] != "DEBUG" ||
+		entry["attempts"] != float64(2) ||
+		entry["error_kind"] != string(ErrorTransportTimeout) ||
+		entry["will_retry"] != false ||
+		entry["downstream_exception"] != "0x0B" {
+		t.Fatalf("unexpected final failure log: %+v", entry)
+	}
+}
+
+func TestClient_ProtocolExceptionLogPreservesCode(t *testing.T) {
+	output, logger := newDiagnosticLogger()
+	client, sessions := newFakeClient([]fakeResult{{err: &gridmodbus.Error{
+		FunctionCode:  FuncReadHoldingRegisters | 0x80,
+		ExceptionCode: ExcIllegalAddress,
+	}}})
+	client.logger = logger
+
+	_, err := client.Execute(t.Context(), readRequest())
+	if ErrorKindOf(err) != ErrorProtocolException {
+		t.Fatalf("expected protocol exception, got %v", err)
+	}
+	entry := findLogEntry(t, output, "upstream request failed")
+	requireLifecycleFields(t, entry)
+	if entry["level"] != "DEBUG" ||
+		entry["attempts"] != float64(1) ||
+		entry["exception_code"] != "0x02" ||
+		entry["downstream_exception"] != "0x02" ||
+		entry["will_retry"] != false {
+		t.Fatalf("unexpected protocol exception log: %+v", entry)
+	}
+	if sessions.client.callCount() != 1 || sessions.sessions.Load() != 1 {
+		t.Fatalf("protocol exception reconnected or retried: calls=%d sessions=%d", sessions.client.callCount(), sessions.sessions.Load())
+	}
+}
+
+func TestClient_WriteDiagnosticsNeverLogPayload(t *testing.T) {
+	const payload = "sensitivepayload1234"
+	output, logger := newDiagnosticLogger()
+	client, _ := newFakeClient([]fakeResult{{err: errors.New(payload)}})
+	client.logger = logger
+	req := &Request{
+		SlaveID:      7,
+		FunctionCode: FuncWriteMultipleRegs,
+		Address:      42,
+		Quantity:     10,
+		Data:         []byte(payload),
+	}
+
+	if _, err := client.Execute(t.Context(), req); err == nil {
+		t.Fatal("expected write failure")
+	}
+	if bytes.Contains(output.Bytes(), []byte(payload)) {
+		t.Fatalf("write payload leaked into logs: %s", output.String())
+	}
+	entry := findLogEntry(t, output, "upstream request failed")
+	requireLifecycleFields(t, entry)
+	if entry["write"] != true || entry["slave_id"] != float64(7) || entry["addr"] != float64(42) {
+		t.Fatalf("write identity missing from diagnostics: %+v", entry)
+	}
+}
+
+func TestClient_HealthDiagnosticsRetainAndClearRecoveredRetry(t *testing.T) {
+	clock := &testClock{now: time.Unix(1000, 0)}
+	client, _ := newFakeClient([]fakeResult{
+		{err: fakeTimeoutError{}},
+		{data: []byte{0x12, 0x34}},
+		{data: []byte{0x56, 0x78}},
+	})
+	client.now = clock.Now
+
+	if _, err := client.Execute(t.Context(), readRequest()); err != nil {
+		t.Fatalf("recovered retry: %v", err)
+	}
+	stats := client.HealthStats()
+	if stats.TotalRetries != 1 ||
+		stats.RecoveredRetries != 1 ||
+		stats.ConsecutiveFirstAttemptFailure != 1 ||
+		stats.ConsecutiveFinalFailure != 0 ||
+		!stats.Degraded ||
+		stats.SustainedDegradation {
+		t.Fatalf("unexpected recovered retry diagnostics: %+v", stats)
+	}
+	if err := client.Healthy(); err != nil {
+		t.Fatalf("isolated recovered retry failed health: %v", err)
+	}
+	status, details := client.HealthStatus()
+	if status != "ok" || details["degraded"] != true || details["sustained_degradation"] != false {
+		t.Fatalf("isolated retry status=%q details=%+v", status, details)
+	}
+
+	clock.Advance(degradedHealthWindow)
+	status, details = client.HealthStatus()
+	if status != "degraded" || details["sustained_degradation"] != true {
+		t.Fatalf("sustained degradation status=%q details=%+v", status, details)
+	}
+	if err := client.Healthy(); err != nil {
+		t.Fatalf("sustained recovered degradation should remain available: %v", err)
+	}
+
+	clock.Advance(time.Second)
+	if _, err := client.Execute(t.Context(), readRequest()); err != nil {
+		t.Fatalf("first-attempt success: %v", err)
+	}
+	stats = client.HealthStats()
+	if stats.Degraded ||
+		stats.SustainedDegradation ||
+		stats.ConsecutiveFirstAttemptFailure != 0 ||
+		stats.TotalRetries != 1 ||
+		stats.RecoveredRetries != 1 ||
+		stats.LastFirstAttemptSuccess.IsZero() ||
+		stats.LastSuccessfulRequest.IsZero() {
+		t.Fatalf("first-attempt success did not clear degradation: %+v", stats)
+	}
+}
+
+func TestClient_DiagnosticCountersTrackConsecutiveFinalFailures(t *testing.T) {
+	client, _ := newFakeClient([]fakeResult{
+		{err: fakeTimeoutError{}},
+		{err: fakeTimeoutError{}},
+		{err: fakeTimeoutError{}},
+		{err: fakeTimeoutError{}},
+		{data: []byte{0x12, 0x34}},
+	})
+
+	for range 2 {
+		if _, err := client.Execute(t.Context(), readRequest()); err == nil {
+			t.Fatal("expected final failure")
+		}
+	}
+	stats := client.HealthStats()
+	if stats.TotalRetries != 2 ||
+		stats.RecoveredRetries != 0 ||
+		stats.ConsecutiveFirstAttemptFailure != 2 ||
+		stats.ConsecutiveFinalFailure != 2 {
+		t.Fatalf("unexpected failure counters: %+v", stats)
+	}
+
+	if _, err := client.Execute(t.Context(), readRequest()); err != nil {
+		t.Fatalf("first-attempt recovery: %v", err)
+	}
+	stats = client.HealthStats()
+	if stats.ConsecutiveFirstAttemptFailure != 0 || stats.ConsecutiveFinalFailure != 0 {
+		t.Fatalf("success did not clear consecutive counters: %+v", stats)
+	}
+}
+
 func TestClient_ExpiredQueueRequestNeverExecutes(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -303,6 +589,9 @@ func TestClient_ContextDeadlineCapsAttempt(t *testing.T) {
 	}
 	if ErrorKindOf(err) != ErrorContextDeadline {
 		t.Fatalf("expected context deadline classification, got %s", ErrorKindOf(err))
+	}
+	if stats := client.HealthStats(); stats.ConsecutiveFinalFailure != 0 {
+		t.Fatalf("request deadline counted as upstream final failure: %+v", stats)
 	}
 	if client.session != nil {
 		t.Fatal("deadline-failed connection was retained")
@@ -369,6 +658,9 @@ func TestClient_SuccessRacingCancellationReturnsCancellationAndKeepsConnection(t
 	if client.session == nil {
 		t.Fatal("matching successful response unnecessarily closed connection")
 	}
+	if stats := client.HealthStats(); stats.ConsecutiveFinalFailure != 0 {
+		t.Fatalf("post-response cancellation counted as upstream final failure: %+v", stats)
+	}
 }
 
 func TestClient_SuccessReturnsBeforePacingDelay(t *testing.T) {
@@ -416,6 +708,9 @@ func TestClient_NextRequestPacingUsesNextRequestBudget(t *testing.T) {
 	}
 	if sessions.client.callCount() != 1 {
 		t.Fatalf("expired paced request made %d wire calls", sessions.client.callCount())
+	}
+	if stats := client.HealthStats(); stats.ConsecutiveFinalFailure != 0 {
+		t.Fatalf("pacing deadline counted as upstream final failure: %+v", stats)
 	}
 
 	laterDone := make(chan error, 1)
