@@ -3,6 +3,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -36,9 +37,10 @@ type Cache struct {
 }
 
 type inflightRequest struct {
-	done   chan struct{}
-	result []byte
-	err    error
+	done      chan struct{}
+	result    []byte
+	err       error
+	followers int
 }
 
 // New creates a new cache with the specified default TTL.
@@ -211,51 +213,65 @@ func (c *Cache) DeleteRange(slaveID byte, functionCode byte, startAddr uint16, q
 // Other callers with the same key wait for and share the first caller's result.
 // This handles request coalescing only — it does not interact with cache storage.
 func (c *Cache) Coalesce(ctx context.Context, key string, fetch func(context.Context) ([]byte, error)) ([]byte, error) {
-	c.inflightMu.Lock()
-	if req, ok := c.inflight[key]; ok {
-		c.inflightMu.Unlock()
-		// Wait for the in-flight request to complete
-		select {
-		case <-req.done:
-			if req.err != nil {
-				return nil, req.err
-			}
-			// Return a copy
-			data := make([]byte, len(req.result))
-			copy(data, req.result)
-			return data, nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
+
+		c.inflightMu.Lock()
+		req, ok := c.inflight[key]
+		if !ok {
+			req = &inflightRequest{done: make(chan struct{})}
+			c.inflight[key] = req
+		} else {
+			req.followers++
+		}
+		c.inflightMu.Unlock()
+
+		if ok {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			select {
+			case <-req.done:
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if req.err != nil {
+					if errors.Is(req.err, context.Canceled) || errors.Is(req.err, context.DeadlineExceeded) {
+						continue
+					}
+					return nil, req.err
+				}
+				data := make([]byte, len(req.result))
+				copy(data, req.result)
+				return data, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		data, err := fetch(ctx)
+		if err == nil {
+			err = ctx.Err()
+		}
+
+		req.result = data
+		req.err = err
+
+		c.inflightMu.Lock()
+		delete(c.inflight, key)
+		c.inflightMu.Unlock()
+		close(req.done)
+
+		if err != nil {
+			return nil, err
+		}
+
+		result := make([]byte, len(data))
+		copy(result, data)
+		return result, nil
 	}
-
-	// Create new in-flight request
-	req := &inflightRequest{
-		done: make(chan struct{}),
-	}
-	c.inflight[key] = req
-	c.inflightMu.Unlock()
-
-	// Fetch the data
-	data, err := fetch(ctx)
-
-	// Store result for waiters
-	req.result = data
-	req.err = err
-
-	// Clean up and notify waiters
-	c.inflightMu.Lock()
-	delete(c.inflight, key)
-	c.inflightMu.Unlock()
-	close(req.done)
-
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]byte, len(data))
-	copy(result, data)
-	return result, nil
 }
 
 // cleanupOnce runs a single cleanup pass, removing expired entries.

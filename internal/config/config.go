@@ -26,7 +26,8 @@ type Config struct {
 	CacheTTL        time.Duration
 	CacheServeStale bool
 	ReadOnly        ReadOnlyMode
-	Timeout         time.Duration
+	AttemptTimeout  time.Duration
+	RequestTimeout  time.Duration
 	RequestDelay    time.Duration
 	ConnectDelay    time.Duration
 	ShutdownTimeout time.Duration
@@ -43,7 +44,8 @@ func Load() (*Config, error) {
 		CacheTTL:        10 * time.Second,
 		CacheServeStale: false,
 		ReadOnly:        ReadOnlyOn,
-		Timeout:         10 * time.Second,
+		AttemptTimeout:  10 * time.Second,
+		RequestTimeout:  30 * time.Second,
 		RequestDelay:    0,
 		ConnectDelay:    0,
 		ShutdownTimeout: 30 * time.Second,
@@ -92,13 +94,36 @@ func Load() (*Config, error) {
 		}
 	}
 
-	// Parse timeout
-	if s := os.Getenv("MODBUS_TIMEOUT"); s != "" {
+	attemptTimeout, attemptTimeoutSet, err := parsePositiveDuration("MODBUS_ATTEMPT_TIMEOUT")
+	if err != nil {
+		return nil, err
+	}
+	legacyTimeout, legacyTimeoutSet, err := parsePositiveDuration("MODBUS_TIMEOUT")
+	if err != nil {
+		return nil, err
+	}
+	if attemptTimeoutSet && legacyTimeoutSet && attemptTimeout != legacyTimeout {
+		return nil, fmt.Errorf(
+			"MODBUS_ATTEMPT_TIMEOUT (%s) and deprecated MODBUS_TIMEOUT (%s) must match when both are set",
+			attemptTimeout,
+			legacyTimeout,
+		)
+	}
+	if attemptTimeoutSet {
+		cfg.AttemptTimeout = attemptTimeout
+	} else if legacyTimeoutSet {
+		cfg.AttemptTimeout = legacyTimeout
+	}
+
+	if s := os.Getenv("MODBUS_REQUEST_TIMEOUT"); s != "" {
 		d, err := time.ParseDuration(s)
 		if err != nil {
-			return nil, fmt.Errorf("invalid MODBUS_TIMEOUT: %w", err)
+			return nil, fmt.Errorf("invalid MODBUS_REQUEST_TIMEOUT: %w", err)
 		}
-		cfg.Timeout = d
+		if d <= 0 {
+			return nil, fmt.Errorf("invalid MODBUS_REQUEST_TIMEOUT: must be greater than zero")
+		}
+		cfg.RequestTimeout = d
 	}
 
 	// Parse request delay
@@ -129,6 +154,21 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parsePositiveDuration(name string) (time.Duration, bool, error) {
+	s := os.Getenv(name)
+	if s == "" {
+		return 0, false, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid %s: %w", name, err)
+	}
+	if d <= 0 {
+		return 0, false, fmt.Errorf("invalid %s: must be greater than zero", name)
+	}
+	return d, true, nil
 }
 
 // GetEnv returns the value of the environment variable named by key,

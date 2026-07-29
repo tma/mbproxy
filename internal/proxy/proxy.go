@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/tma/mbproxy/internal/cache"
@@ -27,18 +28,38 @@ type Proxy struct {
 	server *modbus.Server
 	client upstreamClient
 	cache  *cache.Cache
+
+	cacheStateMu    sync.Mutex
+	writeGeneration uint64
 }
 
 // New creates a new proxy instance.
 func New(cfg *config.Config, logger *slog.Logger) (*Proxy, error) {
+	retryBudget := saturatingDurationSum(
+		cfg.AttemptTimeout,
+		cfg.AttemptTimeout,
+		cfg.ConnectDelay,
+		cfg.ConnectDelay,
+		cfg.RequestDelay,
+	)
+	if cfg.RequestTimeout <= retryBudget {
+		logger.Warn("request budget may expire before a full read retry",
+			"attempt_timeout", cfg.AttemptTimeout,
+			"connect_delay", cfg.ConnectDelay,
+			"request_delay", cfg.RequestDelay,
+			"request_timeout", cfg.RequestTimeout,
+			"full_retry_budget", retryBudget,
+		)
+	}
+
 	p := &Proxy{
 		cfg:    cfg,
 		logger: logger,
-		client: modbus.NewClient(cfg.Upstream, cfg.Timeout, cfg.RequestDelay, cfg.ConnectDelay, logger),
+		client: modbus.NewClient(cfg.Upstream, cfg.AttemptTimeout, cfg.RequestDelay, cfg.ConnectDelay, logger),
 		cache:  cache.New(cfg.CacheTTL, cfg.CacheServeStale),
 	}
 
-	p.server = modbus.NewServer(p, logger)
+	p.server = modbus.NewServer(p, cfg.RequestTimeout, logger)
 
 	return p, nil
 }
@@ -55,6 +76,7 @@ func (p *Proxy) Run(ctx context.Context) error {
 		"upstream", p.cfg.Upstream,
 		"readonly", p.cfg.ReadOnly,
 		"cache_ttl", p.cfg.CacheTTL,
+		"request_timeout", p.cfg.RequestTimeout,
 	)
 
 	if err := p.server.Listen(p.cfg.Listen); err != nil {
@@ -99,6 +121,13 @@ func (p *Proxy) Shutdown(timeout time.Duration) error {
 
 // HandleRequest implements modbus.Handler interface.
 func (p *Proxy) HandleRequest(ctx context.Context, req *modbus.Request) ([]byte, error) {
+	if err := modbus.ValidateRequest(req); err != nil {
+		if req == nil {
+			return nil, err
+		}
+		return modbus.BuildExceptionResponse(req.FunctionCode, modbus.DownstreamException(err)), nil
+	}
+
 	if modbus.IsWriteFunction(req.FunctionCode) {
 		return p.handleWrite(ctx, req)
 	}
@@ -107,18 +136,14 @@ func (p *Proxy) HandleRequest(ctx context.Context, req *modbus.Request) ([]byte,
 		return p.handleRead(ctx, req)
 	}
 
-	// Unknown function code
-	p.logger.Debug("unknown function code",
-		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
-		"slave_id", req.SlaveID,
-	)
-	return modbus.BuildExceptionResponse(req.FunctionCode, modbus.ExcIllegalFunction), nil
+	return nil, fmt.Errorf("validated unsupported function code: 0x%02X", req.FunctionCode)
 }
 
 func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, error) {
-	// Check per-register cache
+	p.cacheStateMu.Lock()
 	values, cacheHit := p.cache.GetRange(req.SlaveID, req.FunctionCode, req.Address, req.Quantity)
 	if cacheHit {
+		p.cacheStateMu.Unlock()
 		p.logger.Debug("cache hit",
 			"slave_id", req.SlaveID,
 			"func", fmt.Sprintf("0x%02X", req.FunctionCode),
@@ -127,6 +152,8 @@ func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, er
 		)
 		return assembleResponse(req.FunctionCode, req.Quantity, values), nil
 	}
+	generation := p.writeGeneration
+	p.cacheStateMu.Unlock()
 
 	// Cache miss — fetch with coalescing
 	p.logger.Debug("cache miss",
@@ -136,15 +163,30 @@ func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, er
 		"qty", req.Quantity,
 	)
 
-	rangeKey := cache.RangeKey(req.SlaveID, req.FunctionCode, req.Address, req.Quantity)
+	rangeKey := fmt.Sprintf("%d:%s", generation, cache.RangeKey(req.SlaveID, req.FunctionCode, req.Address, req.Quantity))
 	data, err := p.cache.Coalesce(ctx, rangeKey, func(ctx context.Context) ([]byte, error) {
-		return p.client.Execute(ctx, req)
+		data, err := p.client.Execute(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		regValues := decomposeResponse(req.FunctionCode, req.Quantity, data)
+		if regValues != nil {
+			p.cacheStateMu.Lock()
+			if p.writeGeneration == generation {
+				p.cache.SetRange(req.SlaveID, req.FunctionCode, req.Address, regValues)
+			}
+			p.cacheStateMu.Unlock()
+		}
+		return data, nil
 	})
 
 	if err != nil {
 		// Try serving stale data if configured
-		if p.cfg.CacheServeStale {
-			if staleValues, ok := p.cache.GetRangeStale(req.SlaveID, req.FunctionCode, req.Address, req.Quantity); ok {
+		if p.cfg.CacheServeStale && modbus.ErrorKindOf(err) != modbus.ErrorProtocolException {
+			p.cacheStateMu.Lock()
+			staleValues, ok := p.cache.GetRangeStale(req.SlaveID, req.FunctionCode, req.Address, req.Quantity)
+			p.cacheStateMu.Unlock()
+			if ok {
 				p.logger.Warn("upstream error, serving stale",
 					"slave_id", req.SlaveID,
 					"error", err,
@@ -153,12 +195,6 @@ func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, er
 			}
 		}
 		return nil, err
-	}
-
-	// Decompose response and store per-register
-	regValues := decomposeResponse(req.FunctionCode, req.Quantity, data)
-	if regValues != nil {
-		p.cache.SetRange(req.SlaveID, req.FunctionCode, req.Address, regValues)
 	}
 
 	return data, nil
@@ -186,18 +222,39 @@ func (p *Proxy) handleWrite(ctx context.Context, req *modbus.Request) ([]byte, e
 
 	case config.ReadOnlyOff:
 		// Forward to upstream
-		resp, err := p.client.Execute(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-
-		// Invalidate per-register cache entries for the written range
+		// Invalidate before sending because a transport failure leaves the write
+		// outcome unknown and cached pre-write values are unsafe for reconciliation.
+		p.cacheStateMu.Lock()
+		p.writeGeneration++
 		p.invalidateCache(req)
+		p.cacheStateMu.Unlock()
 
-		return resp, nil
+		defer func() {
+			p.cacheStateMu.Lock()
+			p.writeGeneration++
+			p.invalidateCache(req)
+			p.cacheStateMu.Unlock()
+		}()
+
+		return p.client.Execute(ctx, req)
 	}
 
 	return nil, fmt.Errorf("unknown readonly mode: %s", p.cfg.ReadOnly)
+}
+
+func saturatingDurationSum(durations ...time.Duration) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	var total time.Duration
+	for _, duration := range durations {
+		if duration <= 0 {
+			continue
+		}
+		if duration > maxDuration-total {
+			return maxDuration
+		}
+		total += duration
+	}
+	return total
 }
 
 func (p *Proxy) invalidateCache(req *modbus.Request) {
