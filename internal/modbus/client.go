@@ -33,6 +33,8 @@ type clientSession interface {
 
 type sessionFactory func() (clientSession, requestClient)
 
+const degradedHealthWindow = time.Minute
+
 type guardedConn struct {
 	net.Conn
 
@@ -216,6 +218,18 @@ func (c *tcpSession) BeginRequest(ctx context.Context, attemptTimeout time.Durat
 	}
 }
 
+// HealthStats is a snapshot of upstream reliability diagnostics.
+type HealthStats struct {
+	LastFirstAttemptSuccess        time.Time
+	LastSuccessfulRequest          time.Time
+	ConsecutiveFirstAttemptFailure int
+	ConsecutiveFinalFailure        int
+	TotalRetries                   uint64
+	RecoveredRetries               uint64
+	Degraded                       bool
+	SustainedDegradation           bool
+}
+
 // Client wraps a Modbus TCP client with classified retry behavior.
 type Client struct {
 	address        string
@@ -223,6 +237,9 @@ type Client struct {
 	requestDelay   time.Duration
 	connectDelay   time.Duration
 	logger         *slog.Logger
+	now            func() time.Time
+	degradedWindow time.Duration
+	beforeAcquire  func()
 
 	owner         chan struct{}
 	session       clientSession
@@ -230,9 +247,16 @@ type Client struct {
 	newSession    sessionFactory
 	nextRequestAt time.Time
 
-	healthMu  sync.RWMutex
-	lastErr   error
-	connected bool
+	healthMu         sync.RWMutex
+	lastErr          error
+	connected        bool
+	firstFailureAt   time.Time
+	lastFirstSuccess time.Time
+	lastSuccess      time.Time
+	firstFailures    int
+	finalFailures    int
+	totalRetries     uint64
+	recoveredRetries uint64
 }
 
 // NewClient creates a new Modbus TCP client.
@@ -243,6 +267,8 @@ func NewClient(address string, attemptTimeout, requestDelay, connectDelay time.D
 		requestDelay:   requestDelay,
 		connectDelay:   connectDelay,
 		logger:         logger,
+		now:            time.Now,
+		degradedWindow: degradedHealthWindow,
 		owner:          make(chan struct{}, 1),
 	}
 	c.owner <- struct{}{}
@@ -349,10 +375,14 @@ func (c *Client) release() {
 	c.owner <- struct{}{}
 }
 
-// Healthy reports the last observed upstream state.
+// Healthy reports final upstream failures while recovered retries remain available.
 func (c *Client) Healthy() error {
 	c.healthMu.RLock()
 	defer c.healthMu.RUnlock()
+	return c.healthyLocked()
+}
+
+func (c *Client) healthyLocked() error {
 	if c.lastErr != nil {
 		return c.lastErr
 	}
@@ -362,45 +392,134 @@ func (c *Client) Healthy() error {
 	return nil
 }
 
+// HealthStats returns retry, failure streak, and recovery state.
+func (c *Client) HealthStats() HealthStats {
+	c.healthMu.RLock()
+	defer c.healthMu.RUnlock()
+	return c.healthStatsLocked(c.now())
+}
+
+func (c *Client) healthStatsLocked(now time.Time) HealthStats {
+	degraded := !c.firstFailureAt.IsZero()
+	sustained := degraded &&
+		(c.degradedWindow <= 0 || now.Sub(c.firstFailureAt) >= c.degradedWindow)
+	return HealthStats{
+		LastFirstAttemptSuccess:        c.lastFirstSuccess,
+		LastSuccessfulRequest:          c.lastSuccess,
+		ConsecutiveFirstAttemptFailure: c.firstFailures,
+		ConsecutiveFinalFailure:        c.finalFailures,
+		TotalRetries:                   c.totalRetries,
+		RecoveredRetries:               c.recoveredRetries,
+		Degraded:                       degraded,
+		SustainedDegradation:           sustained,
+	}
+}
+
+// HealthStatus supplies reliability details to the HTTP health endpoint.
+func (c *Client) HealthStatus() (string, map[string]any) {
+	c.healthMu.RLock()
+	defer c.healthMu.RUnlock()
+	return healthStatus(c.healthStatsLocked(c.now()))
+}
+
+// HealthReport returns status, diagnostics, and availability from one snapshot.
+func (c *Client) HealthReport() (string, map[string]any, error) {
+	c.healthMu.RLock()
+	defer c.healthMu.RUnlock()
+	status, details := healthStatus(c.healthStatsLocked(c.now()))
+	return status, details, c.healthyLocked()
+}
+
+func healthStatus(stats HealthStats) (string, map[string]any) {
+	status := "ok"
+	if stats.SustainedDegradation {
+		status = "degraded"
+	}
+	return status, map[string]any{
+		"last_first_attempt_success":         healthTimestamp(stats.LastFirstAttemptSuccess),
+		"last_successful_request":            healthTimestamp(stats.LastSuccessfulRequest),
+		"consecutive_first_attempt_failures": stats.ConsecutiveFirstAttemptFailure,
+		"consecutive_final_failures":         stats.ConsecutiveFinalFailure,
+		"total_retries":                      stats.TotalRetries,
+		"recovered_retries":                  stats.RecoveredRetries,
+		"degraded":                           stats.Degraded,
+		"sustained_degradation":              stats.SustainedDegradation,
+	}
+}
+
+func healthTimestamp(timestamp time.Time) any {
+	if timestamp.IsZero() {
+		return nil
+	}
+	return timestamp
+}
+
 // Execute sends one Modbus request, retrying a read once only after a transport failure.
 func (c *Client) Execute(ctx context.Context, req *Request) ([]byte, error) {
+	start := c.now()
+	timing := requestTiming{}
 	if err := ValidateRequest(req); err != nil {
-		return nil, requestError(err, 0)
+		timing.total = c.now().Sub(start)
+		return nil, requestError(err, 0, timing)
 	}
 
-	if err := c.acquire(ctx); err != nil {
-		return nil, requestError(err, 0)
+	queueStart := c.now()
+	if c.beforeAcquire != nil {
+		c.beforeAcquire()
 	}
+	if err := c.acquire(ctx); err != nil {
+		timing.queue = c.now().Sub(queueStart)
+		timing.total = c.now().Sub(start)
+		return nil, requestError(err, 0, timing)
+	}
+	timing.queue = c.now().Sub(queueStart)
 	defer c.release()
 
 	var lastErr error
 	requestSlotReady := false
 	for attempt := 1; attempt <= 2; attempt++ {
 		if c.session == nil {
+			reconnectStart := c.now()
 			err := c.connectLocked(ctx)
+			timing.reconnect += c.now().Sub(reconnectStart)
 			if err != nil {
 				lastErr = err
 				willRetry := attempt == 1 && IsReadFunction(req.FunctionCode) && isTransportError(err) && contextError(ctx) == nil
+				timing.total = c.now().Sub(start)
+				if attempt == 1 && isTransportError(err) {
+					c.recordFirstFailure()
+				}
 				if willRetry {
-					c.logger.Debug("upstream connect failed, retrying read", "error", err)
+					c.recordRetry()
+					c.logFailure(req, attempt, timing, err, true)
 					continue
 				}
-				return nil, c.finalError(lastErr, attempt)
+				c.logFailure(req, attempt, timing, err, false)
+				return nil, c.finalError(lastErr, attempt, timing)
 			}
 		}
 
 		if !requestSlotReady {
+			queueStart = c.now()
 			if err := c.waitForRequestSlot(ctx); err != nil {
-				return nil, c.finalError(err, attempt-1)
+				timing.queue += c.now().Sub(queueStart)
+				timing.total = c.now().Sub(start)
+				c.logFailure(req, attempt-1, timing, err, false)
+				return nil, c.finalError(err, attempt-1, timing)
 			}
+			timing.queue += c.now().Sub(queueStart)
 			requestSlotReady = true
 		}
 		if err := contextError(ctx); err != nil {
-			return nil, c.finalError(err, attempt-1)
+			timing.total = c.now().Sub(start)
+			c.logFailure(req, attempt-1, timing, err, false)
+			return nil, c.finalError(err, attempt-1, timing)
 		}
 		c.session.SetSlave(req.SlaveID)
 		if err := contextError(ctx); err != nil {
-			return nil, c.finalError(err, attempt-1)
+			timing.total = c.now().Sub(start)
+			c.logFailure(req, attempt-1, timing, err, false)
+			return nil, c.finalError(err, attempt-1, timing)
 		}
 		attemptTimeout := c.socketTimeoutFor(ctx)
 		finishRequest := c.session.BeginRequest(ctx, attemptTimeout)
@@ -408,12 +527,14 @@ func (c *Client) Execute(ctx context.Context, req *Request) ([]byte, error) {
 			if finishErr := finishRequest(); finishErr != nil {
 				c.logger.Debug("finishing canceled upstream request failed", "error", finishErr)
 			}
-			return nil, c.finalError(err, attempt-1)
+			timing.total = c.now().Sub(start)
+			c.logFailure(req, attempt-1, timing, err, false)
+			return nil, c.finalError(err, attempt-1, timing)
 		}
-		attemptStart := time.Now()
+		attemptStart := c.now()
 		resp, err := c.executeRequest(ctx, req)
 		responseCompletedAt := time.Now()
-		attemptDuration := time.Since(attemptStart)
+		timing.attempt += c.now().Sub(attemptStart)
 		if finishErr := finishRequest(); finishErr != nil {
 			c.logger.Debug("finishing upstream request failed", "error", finishErr)
 		}
@@ -430,38 +551,44 @@ func (c *Client) Execute(ctx context.Context, req *Request) ([]byte, error) {
 				c.nextRequestAt = responseCompletedAt.Add(c.requestDelay)
 			}
 			if ctxErr := contextError(ctx); ctxErr != nil {
-				return nil, c.finalError(ctxErr, attempt)
+				timing.total = c.now().Sub(start)
+				c.logFailure(req, attempt, timing, ctxErr, false)
+				return nil, c.finalError(ctxErr, attempt, timing)
 			}
-			c.recordSuccess()
-			c.logger.Debug("upstream request completed",
-				"slave_id", req.SlaveID,
-				"func", fmt.Sprintf("0x%02X", req.FunctionCode),
-				"addr", req.Address,
-				"qty", req.Quantity,
-				"duration", attemptDuration,
-			)
+			completedAt := c.now()
+			timing.total = completedAt.Sub(start)
+			timing = completeTiming(timing)
+			c.recordSuccess(attempt, completedAt)
+			c.logSuccess(req, attempt, timing)
 			return resp, nil
 		}
 
 		lastErr = err
 		kind, _ = classifyError(err)
+		timing.total = c.now().Sub(start)
 		willRetry := attempt == 1 &&
 			IsReadFunction(req.FunctionCode) &&
 			(kind == ErrorTransportTimeout || kind == ErrorTransportClosed) &&
 			contextError(ctx) == nil
 
+		if attempt == 1 && (kind == ErrorTransportTimeout || kind == ErrorTransportClosed) {
+			c.recordFirstFailure()
+		}
 		if willRetry {
 			c.disconnectLocked()
-			c.logger.Debug("upstream request failed, retrying read", "error", err)
+			c.recordRetry()
+			c.logFailure(req, attempt, timing, err, true)
 			continue
 		}
 		if kind != ErrorProtocolException {
 			c.disconnectLocked()
 		}
-		return nil, c.finalError(lastErr, attempt)
+		c.logFailure(req, attempt, timing, err, false)
+		return nil, c.finalError(lastErr, attempt, timing)
 	}
 
-	return nil, c.finalError(lastErr, 2)
+	timing.total = c.now().Sub(start)
+	return nil, c.finalError(lastErr, 2, timing)
 }
 
 func (c *Client) waitForRequestSlot(ctx context.Context) error {
@@ -525,26 +652,125 @@ func contextError(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) finalError(err error, attempts int) error {
-	reqErr := requestError(err, attempts)
+func completeTiming(timing requestTiming) requestTiming {
+	const maxDuration = time.Duration(1<<63 - 1)
+	var componentTotal time.Duration
+	for _, duration := range []time.Duration{timing.queue, timing.attempt, timing.reconnect} {
+		if duration <= 0 {
+			continue
+		}
+		if duration > maxDuration-componentTotal {
+			componentTotal = maxDuration
+			break
+		}
+		componentTotal += duration
+	}
+	if timing.total < componentTotal {
+		timing.total = componentTotal
+	}
+	return timing
+}
+
+func (c *Client) finalError(err error, attempts int, timing requestTiming) error {
+	reqErr := requestError(err, attempts, completeTiming(timing))
 	if reqErr.Kind == ErrorProtocolException {
 		c.healthMu.Lock()
 		c.lastErr = nil
+		c.finalFailures = 0
 		c.connected = true
 		c.healthMu.Unlock()
 	} else if reqErr.Kind != ErrorContextCanceled {
 		c.healthMu.Lock()
 		c.lastErr = reqErr
+		if reqErr.Kind == ErrorTransportTimeout || reqErr.Kind == ErrorTransportClosed {
+			c.finalFailures++
+		}
 		c.healthMu.Unlock()
 	}
 	return reqErr
 }
 
-func (c *Client) recordSuccess() {
+func (c *Client) recordFirstFailure() {
 	c.healthMu.Lock()
+	if c.firstFailureAt.IsZero() {
+		c.firstFailureAt = c.now()
+	}
+	c.firstFailures++
+	c.healthMu.Unlock()
+}
+
+func (c *Client) recordRetry() {
+	c.healthMu.Lock()
+	c.totalRetries++
+	c.healthMu.Unlock()
+}
+
+func (c *Client) recordSuccess(attempts int, now time.Time) {
+	c.healthMu.Lock()
+	if attempts == 1 {
+		c.lastFirstSuccess = now
+		c.firstFailureAt = time.Time{}
+		c.firstFailures = 0
+	} else {
+		c.recoveredRetries++
+	}
+	c.lastSuccess = now
 	c.lastErr = nil
+	c.finalFailures = 0
 	c.connected = true
 	c.healthMu.Unlock()
+}
+
+func (c *Client) logFailure(req *Request, attempts int, timing requestTiming, err error, willRetry bool) {
+	timing = completeTiming(timing)
+	kind, exceptionCode := classifyError(err)
+	args := []any{
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+		"addr", req.Address,
+		"qty", req.Quantity,
+		"write", IsWriteFunction(req.FunctionCode),
+		"attempt", attempts,
+		"attempts", attempts,
+		"queue_duration", timing.queue,
+		"attempt_duration", timing.attempt,
+		"reconnect_duration", timing.reconnect,
+		"total_duration", timing.total,
+		"error_kind", kind,
+		"will_retry", willRetry,
+	}
+	if !IsWriteFunction(req.FunctionCode) {
+		args = append(args, "error", err)
+	}
+	if exceptionCode != 0 {
+		args = append(args, "exception_code", fmt.Sprintf("0x%02X", exceptionCode))
+	}
+	if !willRetry {
+		args = append(args, "downstream_exception", fmt.Sprintf("0x%02X", DownstreamException(err)))
+	}
+	if willRetry {
+		c.logger.Debug("upstream request attempt failed", args...)
+		return
+	}
+	c.logger.Debug("upstream request failed", args...)
+}
+
+func (c *Client) logSuccess(req *Request, attempts int, timing requestTiming) {
+	c.logger.Debug("upstream request completed",
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+		"addr", req.Address,
+		"qty", req.Quantity,
+		"write", IsWriteFunction(req.FunctionCode),
+		"attempt", attempts,
+		"attempts", attempts,
+		"queue_duration", timing.queue,
+		"attempt_duration", timing.attempt,
+		"reconnect_duration", timing.reconnect,
+		"total_duration", timing.total,
+		"error_kind", "",
+		"will_retry", false,
+	)
 }
 
 func isTransportError(err error) bool {

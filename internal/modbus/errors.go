@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"syscall"
+	"time"
 
 	gridmodbus "github.com/grid-x/modbus"
 )
@@ -24,12 +25,16 @@ const (
 	ErrorLocal             ErrorKind = "local_error"
 )
 
-// RequestError carries the classified request failure.
+// RequestError carries the classified request failure and its timing.
 type RequestError struct {
-	Kind          ErrorKind
-	ExceptionCode byte
-	Attempts      int
-	Err           error
+	Kind              ErrorKind
+	ExceptionCode     byte
+	Attempts          int
+	QueueDuration     time.Duration
+	AttemptDuration   time.Duration
+	ReconnectDuration time.Duration
+	TotalDuration     time.Duration
+	Err               error
 }
 
 type validationError struct {
@@ -162,13 +167,17 @@ func DownstreamException(err error) byte {
 	}
 }
 
-func requestError(err error, attempts int) *RequestError {
+func requestError(err error, attempts int, timing requestTiming) *RequestError {
 	kind, exceptionCode := classifyError(err)
 	return &RequestError{
-		Kind:          kind,
-		ExceptionCode: exceptionCode,
-		Attempts:      attempts,
-		Err:           err,
+		Kind:              kind,
+		ExceptionCode:     exceptionCode,
+		Attempts:          attempts,
+		QueueDuration:     timing.queue,
+		AttemptDuration:   timing.attempt,
+		ReconnectDuration: timing.reconnect,
+		TotalDuration:     timing.total,
+		Err:               err,
 	}
 }
 
@@ -177,4 +186,11 @@ func newValidationError(exceptionCode byte, format string, args ...any) error {
 		exceptionCode: exceptionCode,
 		err:           fmt.Errorf(format, args...),
 	}
+}
+
+type requestTiming struct {
+	queue     time.Duration
+	attempt   time.Duration
+	reconnect time.Duration
+	total     time.Duration
 }

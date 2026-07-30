@@ -173,6 +173,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 
+		requestStart := time.Now()
 		requestCtx := ctx
 		cancel := func() {}
 		if s.requestTimeout > 0 {
@@ -185,11 +186,7 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		cancel()
 		if err != nil {
 			exceptionCode := DownstreamException(err)
-			s.logger.Debug("handler error",
-				"error", err,
-				"func", fmt.Sprintf("0x%02X", req.FunctionCode),
-				"exception", fmt.Sprintf("0x%02X", exceptionCode),
-			)
+			s.logHandlerError(req, err, exceptionCode, time.Since(requestStart))
 			excResp := s.buildExceptionResponse(req, exceptionCode)
 			if writeErr := s.writeResponse(conn, req.TransactionID, req.SlaveID, excResp); writeErr != nil {
 				s.logger.Error("write exception response error", "error", writeErr)
@@ -203,6 +200,63 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 	}
+}
+
+func (s *Server) logHandlerError(req *Request, err error, downstreamException byte, totalDuration time.Duration) {
+	var coalescedMarker interface {
+		Coalesced() bool
+		CoalescedWaitDuration() time.Duration
+	}
+	coalescedWaited := errors.As(err, &coalescedMarker)
+	coalesced := coalescedWaited && coalescedMarker.Coalesced()
+	coalescedWait := time.Duration(0)
+	if coalescedWaited {
+		coalescedWait = coalescedMarker.CoalescedWaitDuration()
+	}
+
+	attempts := 0
+	queueDuration := coalescedWait
+	attemptDuration := time.Duration(0)
+	reconnectDuration := time.Duration(0)
+	var reqErr *RequestError
+	hasRequestError := errors.As(err, &reqErr)
+	if hasRequestError && !coalesced {
+		attempts = reqErr.Attempts
+		queueDuration += reqErr.QueueDuration
+		attemptDuration = reqErr.AttemptDuration
+		reconnectDuration = reqErr.ReconnectDuration
+	}
+
+	args := []any{
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+		"addr", req.Address,
+		"qty", req.Quantity,
+		"write", IsWriteFunction(req.FunctionCode),
+		"attempt", attempts,
+		"attempts", attempts,
+		"queue_duration", queueDuration,
+		"attempt_duration", attemptDuration,
+		"reconnect_duration", reconnectDuration,
+		"total_duration", totalDuration,
+		"error_kind", ErrorKindOf(err),
+		"will_retry", false,
+		"downstream_exception", fmt.Sprintf("0x%02X", downstreamException),
+		"coalesced", coalesced,
+		"coalesced_waited", coalescedWaited,
+		"coalesced_wait_duration", coalescedWait,
+	}
+	if !IsWriteFunction(req.FunctionCode) {
+		args = append(args, "error", err)
+	}
+	if reqErr != nil && reqErr.ExceptionCode != 0 {
+		args = append(args, "exception_code", fmt.Sprintf("0x%02X", reqErr.ExceptionCode))
+	}
+	if ErrorKindOf(err) == ErrorContextCanceled {
+		s.logger.Debug("request canceled", args...)
+		return
+	}
+	s.logger.Warn("request failed", args...)
 }
 
 func (s *Server) readRequest(conn net.Conn) (*Request, error) {

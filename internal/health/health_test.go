@@ -17,8 +17,39 @@ type mockChecker struct {
 	err error
 }
 
+type diagnosticChecker struct {
+	mockChecker
+	status  string
+	details map[string]any
+}
+
+type atomicDiagnosticChecker struct {
+	healthyCalls int
+	statusCalls  int
+	reportCalls  int
+}
+
 func (m *mockChecker) Healthy() error {
 	return m.err
+}
+
+func (c *diagnosticChecker) HealthStatus() (string, map[string]any) {
+	return c.status, c.details
+}
+
+func (c *atomicDiagnosticChecker) Healthy() error {
+	c.healthyCalls++
+	return fmt.Errorf("separate health snapshot used")
+}
+
+func (c *atomicDiagnosticChecker) HealthStatus() (string, map[string]any) {
+	c.statusCalls++
+	return "unhealthy", nil
+}
+
+func (c *atomicDiagnosticChecker) HealthReport() (string, map[string]any, error) {
+	c.reportCalls++
+	return "degraded", map[string]any{"total_retries": uint64(2)}, nil
 }
 
 func TestHandleHealth_OK(t *testing.T) {
@@ -43,6 +74,85 @@ func TestHandleHealth_OK(t *testing.T) {
 	}
 	if resp.Error != "" {
 		t.Errorf("expected no error, got %s", resp.Error)
+	}
+}
+
+func TestHandleHealth_DegradedDiagnosticsRemainAvailable(t *testing.T) {
+	checker := &diagnosticChecker{
+		status: "degraded",
+		details: map[string]any{
+			"total_retries":         uint64(2),
+			"recovered_retries":     uint64(2),
+			"sustained_degradation": true,
+		},
+	}
+	srv := NewServer(":0", checker, slog.Default())
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("degraded health returned status %d", w.Code)
+	}
+	var resp Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != "degraded" ||
+		resp.Details["total_retries"] != float64(2) ||
+		resp.Details["sustained_degradation"] != true {
+		t.Fatalf("unexpected degraded response: %+v", resp)
+	}
+}
+
+func TestHandleHealth_PrefersAtomicReport(t *testing.T) {
+	checker := &atomicDiagnosticChecker{}
+	srv := NewServer(":0", checker, slog.Default())
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("atomic health report returned status %d", w.Code)
+	}
+	var resp Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != "degraded" || resp.Details["total_retries"] != float64(2) {
+		t.Fatalf("unexpected atomic report: %+v", resp)
+	}
+	if checker.reportCalls != 1 || checker.healthyCalls != 0 || checker.statusCalls != 0 {
+		t.Fatalf("health endpoint mixed snapshots: %+v", checker)
+	}
+}
+
+func TestHandleHealth_UnhealthyIncludesDiagnostics(t *testing.T) {
+	checker := &diagnosticChecker{
+		mockChecker: mockChecker{err: fmt.Errorf("upstream unavailable")},
+		status:      "degraded",
+		details: map[string]any{
+			"consecutive_final_failures": float64(3),
+		},
+	}
+	srv := NewServer(":0", checker, slog.Default())
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unhealthy status = %d", w.Code)
+	}
+	var resp Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Status != "unhealthy" ||
+		resp.Details["consecutive_final_failures"] != float64(3) {
+		t.Fatalf("unhealthy response omitted diagnostics: %+v", resp)
 	}
 }
 
