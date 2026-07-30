@@ -41,8 +41,9 @@ Many Modbus devices (inverters, meters, battery systems) have limited polling ca
 - Connect to downstream Modbus device via TCP/IP only
 - Support multiple slave IDs through single connection
 - Support clients requesting different slave IDs through the proxy
-- Auto-reconnect on connection failure (unlimited retries, no backoff)
-- Request pacing: configurable delay between upstream requests to prevent overwhelming slow devices
+- Reconnect after transport failures; retry reads once but never retry ambiguous writes
+- Preserve upstream Modbus exceptions without reconnecting
+- Request pacing: configurable minimum interval between successful upstream requests
 - TCP keep-alive enabled (30s interval) for connection health monitoring
 - Connect delay: optional silent period after establishing connection for device settling
 
@@ -57,7 +58,7 @@ Values are cached per register/coil:
 
 Request coalescing still uses the requested range as its key:
 ```
-{slave_id}:{function_code}:{start_address}:{quantity}
+{write_generation}:{slave_id}:{function_code}:{start_address}:{quantity}
 ```
 
 #### Cache Entry
@@ -71,23 +72,24 @@ type CacheEntry struct {
 
 #### Cache Behavior
 - **Read Operations**: Check the per-register/coil cache first. Return from cache only if every value in the requested range is present and not expired.
-- **Cache Misses**: If any value in the requested range is missing or expired, fetch the full requested range from upstream, then decompose the response into per-register/coil cache entries.
-- **Write Operations**: Always forward to the device when writes are allowed, then invalidate each cached register/coil in the written address range. This prevents overlapping cached read ranges from serving stale values after frequent writes.
+- **Cache Misses**: If any value in the requested range is missing or expired, fetch the full requested range from upstream, then decompose the response into per-register/coil cache entries only if the write generation is unchanged.
+- **Write Operations**: Before forwarding an allowed write, increment the write generation and invalidate each cached register/coil in the written address range. After every write outcome, increment and invalidate again so a read that entered the new generation but executed before the write cannot leave a pre-write value cached. This preserves ambiguous-write invalidation without holding the cache state lock across upstream I/O.
 - **TTL**: Configurable (default: 10 seconds)
 - **Cleanup**: Time-based expiration. Expired entries are removed during cleanup unless stale serving is enabled.
 - **Staleness**: Option to serve stale data on upstream failure (default: off). When enabled, expired entries are retained so they remain available for fallback.
 
 ### Request Coalescing
-- Identical in-flight range requests are coalesced (same slave_id, function, address, quantity)
+- Identical in-flight range requests are coalesced within the same write generation
 - Second request arriving while first is pending will wait for and share the first's response
 - Prevents thundering herd on cache miss
 
 ### Request Pacing
-- Configurable delay after each successful upstream request
+- Configurable minimum interval measured from each successful upstream response
 - Protects slow Modbus devices that cannot handle rapid-fire requests
-- Delay is context-aware: cancelled if the request context is cancelled
-- Only applied after successful requests (not during error recovery/reconnection)
-- Logged at DEBUG level when applied
+- Enforced as a context-aware pre-wire wait for the next request
+- Consumes the next request's end-to-end budget and never delays or reclassifies the completed request
+- Not reapplied between a failed read attempt and its retry
+- Logged at DEBUG level when a request waits for its slot
 
 ### 4. Read-Only Mode
 Three modes:
@@ -110,11 +112,27 @@ Three modes:
 | `MODBUS_CACHE_TTL` | Cache time-to-live | `10s` | `10s`, `1m`, `500ms` |
 | `MODBUS_CACHE_SERVE_STALE` | Serve stale data on upstream error | `false` | `true`, `false` |
 | `MODBUS_READONLY` | Read-only mode | `true` | `false`, `true`, `deny` |
-| `MODBUS_TIMEOUT` | Upstream connection timeout | `10s` | `5s`, `30s` |
-| `MODBUS_REQUEST_DELAY` | Delay after each upstream request | `0` (disabled) | `100ms`, `500ms` |
+| `MODBUS_ATTEMPT_TIMEOUT` | Per-attempt upstream socket timeout | `10s` | `10s`, `30s` |
+| `MODBUS_TIMEOUT` | Deprecated alias for `MODBUS_ATTEMPT_TIMEOUT` | unset | `10s`, `30s` |
+| `MODBUS_REQUEST_TIMEOUT` | End-to-end request budget | `30s` | `30s`, `1m` |
+| `MODBUS_REQUEST_DELAY` | Minimum interval between successful upstream requests | `0` (disabled) | `100ms`, `500ms` |
 | `MODBUS_CONNECT_DELAY` | Silent period after connecting to upstream | `0` (disabled) | `500ms`, `2s` |
 | `MODBUS_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | `30s` | `10s`, `60s` |
 | `LOG_LEVEL` | Log level | `INFO` | `INFO`, `DEBUG` |
+
+`MODBUS_ATTEMPT_TIMEOUT` is preferred. `MODBUS_TIMEOUT` remains accepted as a
+deprecated migration alias. If both are set, their parsed durations must be
+equal or configuration loading fails. These variables do not set or override
+`MODBUS_REQUEST_TIMEOUT`.
+
+The end-to-end budget caps every individual attempt. Retaining the read retry
+requires enough budget for two attempt timeouts, two connect delays, request
+pacing, and dial time. Pacing consumes the next request's budget before its wire
+attempt. Genuine upstream Modbus exception responses keep their nonzero
+exception code downstream. Upstream transport or framing failures, malformed
+exception responses, and total request deadlines map to `0x0B`; local internal
+failures map to `0x04`; local validation keeps the standard validation exception
+codes.
 
 The container health check runs `mbproxy -health`, which performs an internal upstream connectivity check without binding a separate local TCP port.
 
@@ -222,12 +240,12 @@ The cache also exposes `Coalesce(ctx, rangeKey, fetch)` for request coalescing. 
 3. **For reads**:
    - Check every per-register/coil cache key in the requested range
    - If all values are present and valid, reassemble and return the Modbus response
-   - On any miss or expired value: coalesce identical in-flight range requests, then forward to upstream device
-   - Decompose successful upstream responses into per-register/coil cache entries
+   - On any miss or expired value: coalesce identical in-flight range requests within the current write generation, then forward to upstream
+   - Decompose successful upstream responses into per-register/coil cache entries only if the generation is unchanged
    - Return response to client
 4. **For writes**:
    - Check readonly mode
-   - If allowed: forward to upstream, then invalidate every cached register/coil in the written address range
+   - If allowed: increment the write generation and invalidate every cached register/coil in the written address range before forwarding upstream
    - Return response
 
 ## Logging
@@ -242,7 +260,7 @@ level=INFO msg="starting proxy" listen=:5502 upstream=192.168.1.100:502
 level=DEBUG msg="cache hit" slave_id=1 func=0x03 addr=0 qty=10
 level=DEBUG msg="cache miss" slave_id=1 func=0x03 addr=0 qty=10
 level=DEBUG msg="upstream request completed" slave_id=1 func=0x03 addr=0 qty=10 duration=15ms
-level=DEBUG msg="applying request delay" delay=100ms
+level=DEBUG msg="waiting for upstream request slot" delay=100ms
 level=DEBUG msg="applying connect delay" delay=500ms
 level=WARN msg="upstream error, serving stale" slave_id=1 error="timeout"
 level=INFO msg="shutting down"

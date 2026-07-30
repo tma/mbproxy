@@ -33,11 +33,27 @@ All configuration is via environment variables:
 | `MODBUS_CACHE_TTL` | Cache time-to-live | `10s` |
 | `MODBUS_CACHE_SERVE_STALE` | Serve stale data on upstream error | `false` |
 | `MODBUS_READONLY` | Read-only mode: `false`, `true`, `deny` | `true` |
-| `MODBUS_TIMEOUT` | Upstream connection timeout | `10s` |
-| `MODBUS_REQUEST_DELAY` | Delay after each upstream request | `0` (disabled) |
+| `MODBUS_ATTEMPT_TIMEOUT` | Per-attempt upstream socket timeout | `10s` |
+| `MODBUS_TIMEOUT` | Deprecated alias for `MODBUS_ATTEMPT_TIMEOUT` | unset |
+| `MODBUS_REQUEST_TIMEOUT` | Total request budget, including coalescing, queueing, reconnect, retry, and pacing | `30s` |
+| `MODBUS_REQUEST_DELAY` | Minimum interval between successful upstream requests | `0` (disabled) |
 | `MODBUS_CONNECT_DELAY` | Silent period after connecting to upstream | `0` (disabled) |
 | `MODBUS_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | `30s` |
 | `LOG_LEVEL` | Log level: `INFO`, `DEBUG` | `INFO` |
+
+The end-to-end request budget always caps each individual attempt. A full read
+retry budget needs room for two attempt timeouts, two connect delays, request
+pacing, and any dial time. Pacing is a context-aware pre-wire wait charged to
+the next request's budget; it never delays an already received response.
+Existing configurations may keep using `MODBUS_TIMEOUT` during migration.
+When both attempt timeout variables are set, their parsed durations must match
+or startup fails. Neither setting changes `MODBUS_REQUEST_TIMEOUT`.
+
+Downstream exceptions preserve genuine upstream Modbus exception responses with
+nonzero exception codes. Upstream transport, framing or malformed exception
+failures and total request deadlines map to gateway target failed to respond
+(`0x0B`). Local internal failures map to server failure (`0x04`), while local
+validation uses the standard validation exception codes.
 
 `/mbproxy -health` performs an internal upstream connectivity check and does not open a separate local TCP health port.
 
@@ -77,7 +93,8 @@ services:
       MODBUS_CACHE_TTL: "10s"
       MODBUS_CACHE_SERVE_STALE: "false"
       MODBUS_READONLY: "true"
-      MODBUS_TIMEOUT: "10s"
+      MODBUS_ATTEMPT_TIMEOUT: "10s"
+      MODBUS_REQUEST_TIMEOUT: "30s"
       MODBUS_REQUEST_DELAY: "0"
       MODBUS_CONNECT_DELAY: "0"
       MODBUS_SHUTDOWN_TIMEOUT: "30s"
@@ -137,9 +154,9 @@ docker run --rm -v $(pwd):/app -w /app golang:1.24 go test ./...
 - **Key format**: values are cached per register/coil as `{slave_id}:{function_code}:{address}`
 - **Read requests**: Served from cache only if every register/coil in the requested range is present and not expired
 - **Cache misses**: If any value in the requested range is missing or expired, the full range is fetched from upstream and decomposed into per-register/coil cache entries
-- **Write requests**: Forwarded to upstream (if allowed), then invalidate the written address range so overlapping cached reads cannot return stale values
-- **Request coalescing**: Multiple identical range requests during a cache miss share a single upstream fetch using `{slave_id}:{function_code}:{start_address}:{quantity}` as the coalescing key
-- **Stale fallback**: If enabled, expired entries are retained and can be served when upstream requests fail
+- **Write requests**: Before an allowed write is forwarded, its generation is incremented and the written range is invalidated. The generation is incremented and the range invalidated again after every outcome, so neither older reads nor reads that execute in the write scheduling window can leave pre-write values cached.
+- **Request coalescing**: Multiple identical range requests in the same write generation share a single upstream fetch using `{write_generation}:{slave_id}:{function_code}:{start_address}:{quantity}` as the coalescing key
+- **Stale fallback**: If enabled, expired entries are retained and can be served when upstream transport requests fail. Upstream Modbus exceptions are never replaced with stale data.
 
 ## License
 

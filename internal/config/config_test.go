@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,7 +18,9 @@ func TestLoad_Defaults(t *testing.T) {
 	os.Unsetenv("MODBUS_CACHE_TTL")
 	os.Unsetenv("MODBUS_CACHE_SERVE_STALE")
 	os.Unsetenv("MODBUS_READONLY")
+	os.Unsetenv("MODBUS_ATTEMPT_TIMEOUT")
 	os.Unsetenv("MODBUS_TIMEOUT")
+	os.Unsetenv("MODBUS_REQUEST_TIMEOUT")
 	os.Unsetenv("MODBUS_SHUTDOWN_TIMEOUT")
 	os.Unsetenv("HEALTH_LISTEN")
 	os.Unsetenv("LOG_LEVEL")
@@ -45,8 +48,11 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.ReadOnly != ReadOnlyOn {
 		t.Errorf("expected readonly true, got %s", cfg.ReadOnly)
 	}
-	if cfg.Timeout != 10*time.Second {
-		t.Errorf("expected 10s timeout, got %v", cfg.Timeout)
+	if cfg.AttemptTimeout != 10*time.Second {
+		t.Errorf("expected 10s attempt timeout, got %v", cfg.AttemptTimeout)
+	}
+	if cfg.RequestTimeout != 30*time.Second {
+		t.Errorf("expected 30s request timeout, got %v", cfg.RequestTimeout)
 	}
 	if cfg.RequestDelay != 0 {
 		t.Errorf("expected 0 request delay, got %v", cfg.RequestDelay)
@@ -81,7 +87,9 @@ func TestLoad_CustomValues(t *testing.T) {
 	os.Setenv("MODBUS_CACHE_TTL", "30s")
 	os.Setenv("MODBUS_CACHE_SERVE_STALE", "true")
 	os.Setenv("MODBUS_READONLY", "false")
-	os.Setenv("MODBUS_TIMEOUT", "5s")
+	os.Setenv("MODBUS_ATTEMPT_TIMEOUT", "5s")
+	os.Unsetenv("MODBUS_TIMEOUT")
+	os.Setenv("MODBUS_REQUEST_TIMEOUT", "9s")
 	os.Setenv("MODBUS_REQUEST_DELAY", "100ms")
 	os.Setenv("MODBUS_CONNECT_DELAY", "200ms")
 	os.Setenv("MODBUS_SHUTDOWN_TIMEOUT", "60s")
@@ -94,7 +102,9 @@ func TestLoad_CustomValues(t *testing.T) {
 		os.Unsetenv("MODBUS_CACHE_TTL")
 		os.Unsetenv("MODBUS_CACHE_SERVE_STALE")
 		os.Unsetenv("MODBUS_READONLY")
+		os.Unsetenv("MODBUS_ATTEMPT_TIMEOUT")
 		os.Unsetenv("MODBUS_TIMEOUT")
+		os.Unsetenv("MODBUS_REQUEST_TIMEOUT")
 		os.Unsetenv("MODBUS_REQUEST_DELAY")
 		os.Unsetenv("MODBUS_CONNECT_DELAY")
 		os.Unsetenv("MODBUS_SHUTDOWN_TIMEOUT")
@@ -121,8 +131,11 @@ func TestLoad_CustomValues(t *testing.T) {
 	if cfg.ReadOnly != ReadOnlyOff {
 		t.Errorf("expected readonly false, got %s", cfg.ReadOnly)
 	}
-	if cfg.Timeout != 5*time.Second {
-		t.Errorf("expected 5s timeout, got %v", cfg.Timeout)
+	if cfg.AttemptTimeout != 5*time.Second {
+		t.Errorf("expected 5s attempt timeout, got %v", cfg.AttemptTimeout)
+	}
+	if cfg.RequestTimeout != 9*time.Second {
+		t.Errorf("expected 9s request timeout, got %v", cfg.RequestTimeout)
 	}
 	if cfg.RequestDelay != 100*time.Millisecond {
 		t.Errorf("expected 100ms request delay, got %v", cfg.RequestDelay)
@@ -186,8 +199,10 @@ func TestLoad_InvalidDuration(t *testing.T) {
 	os.Setenv("MODBUS_UPSTREAM", "localhost:502")
 	defer os.Unsetenv("MODBUS_UPSTREAM")
 
-	tests := []string{"MODBUS_CACHE_TTL", "MODBUS_TIMEOUT", "MODBUS_REQUEST_DELAY", "MODBUS_CONNECT_DELAY", "MODBUS_SHUTDOWN_TIMEOUT"}
+	tests := []string{"MODBUS_CACHE_TTL", "MODBUS_ATTEMPT_TIMEOUT", "MODBUS_TIMEOUT", "MODBUS_REQUEST_TIMEOUT", "MODBUS_REQUEST_DELAY", "MODBUS_CONNECT_DELAY", "MODBUS_SHUTDOWN_TIMEOUT"}
 	for _, envVar := range tests {
+		os.Unsetenv("MODBUS_ATTEMPT_TIMEOUT")
+		os.Unsetenv("MODBUS_TIMEOUT")
 		os.Setenv(envVar, "invalid")
 		_, err := Load()
 		if err == nil {
@@ -197,13 +212,70 @@ func TestLoad_InvalidDuration(t *testing.T) {
 	}
 }
 
+func TestLoad_NonPositiveTimeouts(t *testing.T) {
+	t.Setenv("MODBUS_UPSTREAM", "localhost:502")
+	for _, envVar := range []string{"MODBUS_ATTEMPT_TIMEOUT", "MODBUS_TIMEOUT", "MODBUS_REQUEST_TIMEOUT"} {
+		t.Run(envVar, func(t *testing.T) {
+			t.Setenv("MODBUS_ATTEMPT_TIMEOUT", "")
+			t.Setenv("MODBUS_TIMEOUT", "")
+			t.Setenv(envVar, "0")
+			if _, err := Load(); err == nil {
+				t.Fatalf("expected error for zero %s", envVar)
+			}
+		})
+	}
+}
+
+func TestLoad_AttemptTimeoutMigration(t *testing.T) {
+	tests := []struct {
+		name        string
+		preferred   string
+		legacy      string
+		want        time.Duration
+		errContains string
+	}{
+		{name: "preferred only", preferred: "4s", want: 4 * time.Second},
+		{name: "legacy only", legacy: "6s", want: 6 * time.Second},
+		{name: "both equal after parsing", preferred: "5s", legacy: "5000ms", want: 5 * time.Second},
+		{name: "both conflict", preferred: "5s", legacy: "6s", errContains: "must match when both are set"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("MODBUS_UPSTREAM", "localhost:502")
+			t.Setenv("MODBUS_ATTEMPT_TIMEOUT", tt.preferred)
+			t.Setenv("MODBUS_TIMEOUT", tt.legacy)
+			t.Setenv("MODBUS_REQUEST_TIMEOUT", "17s")
+
+			cfg, err := Load()
+			if tt.errContains != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.errContains) {
+					t.Fatalf("expected error containing %q, got %v", tt.errContains, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if cfg.AttemptTimeout != tt.want {
+				t.Fatalf("expected attempt timeout %v, got %v", tt.want, cfg.AttemptTimeout)
+			}
+			if cfg.RequestTimeout != 17*time.Second {
+				t.Fatalf("attempt timeout changed request timeout to %v", cfg.RequestTimeout)
+			}
+		})
+	}
+}
+
 func TestLoad_HealthListenCustom(t *testing.T) {
 	// Ensure optional env vars that Load() may read do not inherit
 	// potentially invalid values from the surrounding environment.
 	t.Setenv("MODBUS_LISTEN", "")
 	t.Setenv("MODBUS_READONLY", "")
 	t.Setenv("MODBUS_CACHE_TTL", "")
+	t.Setenv("MODBUS_ATTEMPT_TIMEOUT", "")
 	t.Setenv("MODBUS_TIMEOUT", "")
+	t.Setenv("MODBUS_REQUEST_TIMEOUT", "")
 	t.Setenv("MODBUS_REQUEST_DELAY", "")
 	t.Setenv("MODBUS_CONNECT_DELAY", "")
 	t.Setenv("MODBUS_SHUTDOWN_TIMEOUT", "")

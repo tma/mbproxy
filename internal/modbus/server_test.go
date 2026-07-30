@@ -8,6 +8,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	gridmodbus "github.com/grid-x/modbus"
 )
 
 // mockHandler implements Handler for testing
@@ -26,7 +28,7 @@ func TestServer_AcceptConnections(t *testing.T) {
 		response: []byte{0x03, 0x02, 0x00, 0x01}, // Read holding registers response
 	}
 
-	server := NewServer(handler, logger)
+	server := NewServer(handler, time.Second, logger)
 	if err := server.Listen("127.0.0.1:0"); err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
@@ -127,7 +129,7 @@ func TestServer_ParsePDU(t *testing.T) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	server := NewServer(nil, logger)
+	server := NewServer(nil, time.Second, logger)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -155,6 +157,88 @@ func TestServer_ParsePDU(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServer_PreservesUpstreamException(t *testing.T) {
+	handler := &mockHandler{err: &RequestError{
+		Kind:          ErrorProtocolException,
+		ExceptionCode: ExcIllegalAddress,
+		Attempts:      1,
+		Err: &gridmodbus.Error{
+			FunctionCode:  FuncReadHoldingRegisters | 0x80,
+			ExceptionCode: ExcIllegalAddress,
+		},
+	}}
+	resp := executeServerRequest(t, handler, time.Second)
+	if resp[7] != FuncReadHoldingRegisters|0x80 || resp[8] != ExcIllegalAddress {
+		t.Fatalf("unexpected exception response: % x", resp[7:9])
+	}
+}
+
+func TestServer_MapsRequestDeadlineToGatewayException(t *testing.T) {
+	handler := HandlerFunc(func(ctx context.Context, req *Request) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	resp := executeServerRequest(t, handler, 20*time.Millisecond)
+	if resp[7] != FuncReadHoldingRegisters|0x80 || resp[8] != ExcGatewayTargetFailed {
+		t.Fatalf("unexpected exception response: % x", resp[7:9])
+	}
+}
+
+func TestServer_RejectsNominalSuccessAfterRequestDeadline(t *testing.T) {
+	handler := HandlerFunc(func(context.Context, *Request) ([]byte, error) {
+		time.Sleep(30 * time.Millisecond)
+		return []byte{FuncReadHoldingRegisters, 2, 0, 1}, nil
+	})
+	resp := executeServerRequest(t, handler, 10*time.Millisecond)
+	if resp[7] != FuncReadHoldingRegisters|0x80 || resp[8] != ExcGatewayTargetFailed {
+		t.Fatalf("unexpected deadline response: % x", resp[7:9])
+	}
+}
+
+type HandlerFunc func(context.Context, *Request) ([]byte, error)
+
+func (f HandlerFunc) HandleRequest(ctx context.Context, req *Request) ([]byte, error) {
+	return f(ctx, req)
+}
+
+func executeServerRequest(t *testing.T, handler Handler, timeout time.Duration) []byte {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := NewServer(handler, timeout, logger)
+	if err := server.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := server.Serve(ctx); err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	}()
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("close server: %v", err)
+		}
+	})
+
+	conn, err := net.DialTimeout("tcp", server.listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write(buildMBAPRequest(1, 1, FuncReadHoldingRegisters, 10, 2)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	resp := make([]byte, 9)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	return resp
 }
 
 func TestIsWriteFunction(t *testing.T) {

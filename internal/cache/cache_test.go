@@ -2,6 +2,8 @@ package cache
 
 import (
 	"context"
+	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -310,10 +312,10 @@ func TestCache_ContextCancellation(t *testing.T) {
 
 	// Start a slow fetch
 	go func() {
-		c.Coalesce(ctx, "key1", func(ctx context.Context) ([]byte, error) {
+		_, _ = c.Coalesce(ctx, "key1", func(ctx context.Context) ([]byte, error) {
 			close(fetchStarted)
-			time.Sleep(time.Second)
-			return []byte("fetched"), nil
+			<-ctx.Done()
+			return nil, ctx.Err()
 		})
 	}()
 
@@ -332,6 +334,88 @@ func TestCache_ContextCancellation(t *testing.T) {
 	}
 
 	cancel()
+}
+
+func TestCache_CanceledFollowerDoesNotReturnReadyResult(t *testing.T) {
+	c := New(time.Second, false)
+	defer c.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := &inflightRequest{
+		done:   make(chan struct{}),
+		result: []byte("stale success"),
+	}
+	close(req.done)
+	c.inflight["key1"] = req
+
+	data, err := c.Coalesce(ctx, "key1", func(context.Context) ([]byte, error) {
+		return []byte("should not run"), nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled follower, got data=%q err=%v", data, err)
+	}
+}
+
+func TestCache_LiveFollowerRetriesAfterLeaderDeadline(t *testing.T) {
+	c := New(time.Second, false)
+	defer c.Close()
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderStarted := make(chan struct{})
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := c.Coalesce(leaderCtx, "key1", func(ctx context.Context) ([]byte, error) {
+			close(leaderStarted)
+			<-ctx.Done()
+			return []byte("expired success"), nil
+		})
+		leaderDone <- err
+	}()
+	<-leaderStarted
+
+	followerDone := make(chan struct{})
+	var followerData []byte
+	var followerErr error
+	var followerFetches atomic.Int32
+	go func() {
+		followerData, followerErr = c.Coalesce(context.Background(), "key1", func(context.Context) ([]byte, error) {
+			followerFetches.Add(1)
+			return []byte("fresh"), nil
+		})
+		close(followerDone)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.inflightMu.Lock()
+		req := c.inflight["key1"]
+		joined := req != nil && req.followers == 1
+		c.inflightMu.Unlock()
+		if joined {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second caller did not join the live leader")
+		}
+		runtime.Gosched()
+	}
+
+	cancelLeader()
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled leader, got %v", err)
+	}
+	select {
+	case <-followerDone:
+	case <-time.After(time.Second):
+		t.Fatal("live follower did not retry after leader cancellation")
+	}
+	if followerErr != nil || string(followerData) != "fresh" {
+		t.Fatalf("unexpected follower result data=%q err=%v", followerData, followerErr)
+	}
+	if followerFetches.Load() != 1 {
+		t.Fatalf("follower fetch ran %d times", followerFetches.Load())
+	}
 }
 
 func TestCache_DataIsolation(t *testing.T) {

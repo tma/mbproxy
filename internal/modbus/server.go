@@ -27,10 +27,11 @@ const (
 
 // Modbus exception codes
 const (
-	ExcIllegalFunction = 0x01
-	ExcIllegalAddress  = 0x02
-	ExcIllegalValue    = 0x03
-	ExcServerFailure   = 0x04
+	ExcIllegalFunction     = 0x01
+	ExcIllegalAddress      = 0x02
+	ExcIllegalValue        = 0x03
+	ExcServerFailure       = 0x04
+	ExcGatewayTargetFailed = 0x0B
 )
 
 // MBAP header size (Modbus Application Protocol)
@@ -56,9 +57,10 @@ type Handler interface {
 
 // Server is a Modbus TCP server.
 type Server struct {
-	listener net.Listener
-	handler  Handler
-	logger   *slog.Logger
+	listener       net.Listener
+	handler        Handler
+	logger         *slog.Logger
+	requestTimeout time.Duration
 
 	mu       sync.Mutex
 	conns    map[net.Conn]struct{}
@@ -67,11 +69,12 @@ type Server struct {
 }
 
 // NewServer creates a new Modbus TCP server.
-func NewServer(handler Handler, logger *slog.Logger) *Server {
+func NewServer(handler Handler, requestTimeout time.Duration, logger *slog.Logger) *Server {
 	return &Server{
-		handler: handler,
-		logger:  logger,
-		conns:   make(map[net.Conn]struct{}),
+		handler:        handler,
+		logger:         logger,
+		requestTimeout: requestTimeout,
+		conns:          make(map[net.Conn]struct{}),
 	}
 }
 
@@ -170,12 +173,28 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 
-		resp, err := s.handler.HandleRequest(ctx, req)
+		requestCtx := ctx
+		cancel := func() {}
+		if s.requestTimeout > 0 {
+			requestCtx, cancel = context.WithTimeout(ctx, s.requestTimeout)
+		}
+		resp, err := s.handler.HandleRequest(requestCtx, req)
+		if err == nil {
+			err = contextError(requestCtx)
+		}
+		cancel()
 		if err != nil {
-			s.logger.Debug("handler error", "error", err, "func", fmt.Sprintf("0x%02X", req.FunctionCode))
-			// Send exception response
-			excResp := s.buildExceptionResponse(req, ExcServerFailure)
-			s.writeResponse(conn, req.TransactionID, req.SlaveID, excResp)
+			exceptionCode := DownstreamException(err)
+			s.logger.Debug("handler error",
+				"error", err,
+				"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+				"exception", fmt.Sprintf("0x%02X", exceptionCode),
+			)
+			excResp := s.buildExceptionResponse(req, exceptionCode)
+			if writeErr := s.writeResponse(conn, req.TransactionID, req.SlaveID, excResp); writeErr != nil {
+				s.logger.Error("write exception response error", "error", writeErr)
+				return
+			}
 			continue
 		}
 
