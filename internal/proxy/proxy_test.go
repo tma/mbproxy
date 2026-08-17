@@ -21,6 +21,7 @@ type mockClient struct {
 	response []byte
 	err      error
 	calls    int
+	lastReq  *modbus.Request
 }
 
 type healthReportingClient struct {
@@ -112,6 +113,7 @@ func (m *mockClient) Healthy() error { return nil }
 
 func (m *mockClient) Execute(ctx context.Context, req *modbus.Request) ([]byte, error) {
 	m.calls++
+	m.lastReq = req
 	return m.response, m.err
 }
 
@@ -539,37 +541,136 @@ func TestProxy_HandleWriteReadOnlyMode(t *testing.T) {
 	}
 }
 
-func TestProxy_HandleUnknownFunction(t *testing.T) {
+func TestProxy_HandleUnknownFunctionForwardsUpstream(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	c := cache.New(time.Second, false)
 	defer c.Close()
+	upstream := &mockClient{response: []byte{0x41, 0x00, 0xAA}}
 
 	p := &Proxy{
 		cfg: &config.Config{
 			ReadOnly: config.ReadOnlyOn,
 		},
 		logger: logger,
+		client: upstream,
 		cache:  c,
 	}
 
 	req := &modbus.Request{
 		SlaveID:      1,
-		FunctionCode: 0x99, // Unknown function
-		Address:      0,
-		Quantity:     1,
+		FunctionCode: 0x41,
+		PDU:          []byte{0x41, 0x00, 0x01, 0x02},
 	}
 
 	resp, err := p.HandleRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	// Should return exception response
-	if resp[0] != 0x99|0x80 {
-		t.Errorf("expected exception function code 0x%02X, got 0x%02X", 0x99|0x80, resp[0])
+	if !bytes.Equal(resp, upstream.response) {
+		t.Fatalf("forwarded response: got % x, want % x", resp, upstream.response)
 	}
-	if resp[1] != modbus.ExcIllegalFunction {
-		t.Errorf("expected illegal function exception, got 0x%02X", resp[1])
+	if upstream.calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", upstream.calls)
+	}
+	if upstream.lastReq == nil {
+		t.Fatal("upstream did not receive the vendor request")
+	}
+	if !bytes.Equal(upstream.lastReq.PDU, req.PDU) {
+		t.Fatalf("upstream request PDU = % x, want % x", upstream.lastReq.PDU, req.PDU)
+	}
+}
+
+func TestProxy_VendorFunctionForwardsInReadOnlyDeny(t *testing.T) {
+	upstream := &mockClient{response: []byte{0x41, 0x00, 0xAA}}
+	p := &Proxy{
+		cfg:    &config.Config{ReadOnly: config.ReadOnlyDeny},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		client: upstream,
+		cache:  cache.New(time.Second, false),
+	}
+	defer p.cache.Close()
+
+	resp, err := p.HandleRequest(context.Background(), &modbus.Request{
+		SlaveID:      1,
+		FunctionCode: 0x41,
+		PDU:          []byte{0x41, 0x00, 0x01},
+	})
+	if err != nil {
+		t.Fatalf("vendor request: %v", err)
+	}
+	if !bytes.Equal(resp, upstream.response) {
+		t.Fatalf("deny mode blocked vendor passthrough: % x", resp)
+	}
+	if upstream.calls != 1 {
+		t.Fatalf("upstream calls = %d, want 1", upstream.calls)
+	}
+}
+
+func TestProxy_VendorFunctionDoesNotUseOrInvalidateCache(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := cache.New(time.Second, false)
+	defer c.Close()
+	c.SetRange(1, modbus.FuncReadHoldingRegisters, 0, [][]byte{{0x00, 0x0A}})
+	upstream := &mockClient{response: []byte{0x41, 0x00, 0xAA}}
+	p := &Proxy{
+		cfg:    &config.Config{ReadOnly: config.ReadOnlyOn},
+		logger: logger,
+		client: upstream,
+		cache:  c,
+	}
+
+	vendor := &modbus.Request{
+		SlaveID:      1,
+		FunctionCode: 0x41,
+		PDU:          []byte{0x41, 0x00, 0x01},
+	}
+	if _, err := p.HandleRequest(context.Background(), vendor); err != nil {
+		t.Fatalf("vendor request: %v", err)
+	}
+	if upstream.calls != 1 {
+		t.Fatalf("vendor request calls = %d, want 1", upstream.calls)
+	}
+
+	read := &modbus.Request{
+		SlaveID:      1,
+		FunctionCode: modbus.FuncReadHoldingRegisters,
+		Address:      0,
+		Quantity:     1,
+	}
+	resp, err := p.HandleRequest(context.Background(), read)
+	if err != nil {
+		t.Fatalf("cached read: %v", err)
+	}
+	if !bytes.Equal(resp, []byte{0x03, 0x02, 0x00, 0x0A}) {
+		t.Fatalf("cached read changed after vendor passthrough: % x", resp)
+	}
+	if upstream.calls != 1 {
+		t.Fatalf("cached read reached upstream, calls = %d", upstream.calls)
+	}
+}
+
+func TestProxy_MissingVendorPDUReturnsIllegalFunctionWithoutUpstream(t *testing.T) {
+	upstream := &mockClient{}
+	p := &Proxy{
+		cfg:    &config.Config{ReadOnly: config.ReadOnlyOff},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		client: upstream,
+		cache:  cache.New(time.Second, false),
+	}
+	defer p.cache.Close()
+
+	resp, err := p.HandleRequest(context.Background(), &modbus.Request{
+		SlaveID:      1,
+		FunctionCode: 0x41,
+	})
+	if err != nil {
+		t.Fatalf("handle request: %v", err)
+	}
+	if !bytes.Equal(resp, []byte{0x41 | 0x80, modbus.ExcIllegalFunction}) {
+		t.Fatalf("unexpected validation response: % x", resp)
+	}
+	if upstream.calls != 0 {
+		t.Fatalf("invalid vendor request reached upstream %d times", upstream.calls)
 	}
 }
 

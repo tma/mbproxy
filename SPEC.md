@@ -36,6 +36,9 @@ Many Modbus devices (inverters, meters, battery systems) have limited polling ca
   - `0x06` Write Single Register
   - `0x0F` Write Multiple Coils
   - `0x10` Write Multiple Registers
+- Forward any other function code as an opaque PDU. This covers vendor codes
+  such as Huawei SUN2000 `0x41` (installer login and file transfer). Opaque
+  requests are not cached and are not retried.
 
 ### 2. Upstream Connection
 - Connect to downstream Modbus device via TCP/IP only
@@ -124,6 +127,10 @@ Three modes:
 - `false`: Full read/write passthrough
 - `true` (default): Silently ignore write requests, return success
 - `deny`: Reject write requests with Modbus exception (illegal function)
+
+Read-only mode applies only to the four standard write function codes. Vendor
+and other non-standard function codes are always forwarded, because mbproxy
+cannot invent a valid response for an unknown PDU.
 
 ### 5. Graceful Shutdown
 - Handle SIGTERM/SIGINT signals
@@ -275,6 +282,10 @@ The cache also exposes `Coalesce(ctx, rangeKey, fetch)` for request coalescing. 
    - Check readonly mode
    - If allowed: increment the write generation and invalidate every cached register/coil in the written address range before forwarding upstream
    - Return response
+5. **For other function codes**:
+   - Forward the raw PDU upstream
+   - Do not cache, coalesce, or retry
+   - Do not invent a local success or exception response unless the PDU itself is missing or malformed
 
 ## Logging
 
