@@ -48,6 +48,7 @@ type Request struct {
 	Address       uint16
 	Quantity      uint16
 	Data          []byte // For write operations
+	PDU           []byte // Raw PDU, including function code
 }
 
 // Handler interface for processing Modbus requests.
@@ -302,6 +303,8 @@ func (s *Server) readRequest(conn net.Conn) (*Request, error) {
 }
 
 func (s *Server) parsePDU(req *Request, pdu []byte) error {
+	req.PDU = append([]byte(nil), pdu...)
+
 	switch req.FunctionCode {
 	case FuncReadCoils, FuncReadDiscreteInputs, FuncReadHoldingRegisters, FuncReadInputRegisters:
 		if len(pdu) < 5 {
@@ -331,7 +334,7 @@ func (s *Server) parsePDU(req *Request, pdu []byte) error {
 		req.Data = pdu[6 : 6+byteCount]
 
 	default:
-		// Unknown function code - let handler deal with it
+		// Unknown function codes keep the raw PDU for opaque forwarding.
 	}
 
 	return nil

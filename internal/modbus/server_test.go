@@ -150,6 +150,11 @@ func TestServer_ParsePDU(t *testing.T) {
 			wantQty:  2,
 			wantData: []byte{0x00, 0x0A, 0x01, 0x02},
 		},
+		{
+			name:     "vendor function keeps raw pdu",
+			funcCode: 0x41,
+			pdu:      []byte{0x41, 0x00, 0x01, 0x02, 0x03},
+		},
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -169,6 +174,9 @@ func TestServer_ParsePDU(t *testing.T) {
 			if req.Quantity != tt.wantQty {
 				t.Errorf("quantity: got %d, want %d", req.Quantity, tt.wantQty)
 			}
+			if !bytes.Equal(req.PDU, tt.pdu) {
+				t.Errorf("pdu: got % x, want % x", req.PDU, tt.pdu)
+			}
 			if tt.wantData != nil {
 				if len(req.Data) != len(tt.wantData) {
 					t.Errorf("data length: got %d, want %d", len(req.Data), len(tt.wantData))
@@ -180,6 +188,67 @@ func TestServer_ParsePDU(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestServer_ForwardsVendorPDUToHandler(t *testing.T) {
+	var got *Request
+	handler := HandlerFunc(func(_ context.Context, req *Request) ([]byte, error) {
+		got = req
+		return []byte{0x41, 0x00, 0xAA}, nil
+	})
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := NewServer(handler, time.Second, logger)
+	if err := server.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := server.Serve(ctx); err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	}()
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("close server: %v", err)
+		}
+	})
+
+	conn, err := net.DialTimeout("tcp", server.listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	pdu := []byte{0x41, 0x00, 0x01, 0x02, 0x03}
+	frame := make([]byte, 7+len(pdu))
+	binary.BigEndian.PutUint16(frame[0:2], 7)
+	binary.BigEndian.PutUint16(frame[4:6], uint16(len(pdu)+1))
+	frame[6] = 1
+	copy(frame[7:], pdu)
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	header := make([]byte, mbapHeaderSize)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		t.Fatalf("read header: %v", err)
+	}
+	pduLen := int(binary.BigEndian.Uint16(header[4:6])) - 1
+	if pduLen < 1 {
+		t.Fatalf("invalid response length: %d", pduLen)
+	}
+	respPDU := make([]byte, pduLen)
+	if _, err := io.ReadFull(conn, respPDU); err != nil {
+		t.Fatalf("read pdu: %v", err)
+	}
+	if !bytes.Equal(respPDU, []byte{0x41, 0x00, 0xAA}) {
+		t.Fatalf("unexpected response: % x", respPDU)
+	}
+	if got == nil || got.FunctionCode != 0x41 || !bytes.Equal(got.PDU, pdu) {
+		t.Fatalf("handler request = %+v", got)
 	}
 }
 

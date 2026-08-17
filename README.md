@@ -7,6 +7,7 @@ A lightweight Modbus TCP proxy with in-memory caching. Designed to reduce load o
 - **Caching**: In-memory cache with configurable TTL
 - **Request coalescing**: Identical concurrent requests share a single upstream fetch
 - **Read-only mode**: Optionally block or ignore write requests
+- **Vendor function codes**: Forward non-standard PDUs such as Huawei `0x41` without caching or retrying them
 - **Auto-reconnect**: Automatic upstream reconnection on failure
 - **Stale data fallback**: Optionally serve stale cache on upstream errors
 - **Request diagnostics**: Structured lifecycle timing, retry, exception, and health state
@@ -92,6 +93,11 @@ corresponding success has occurred.
 - `false`: Full read/write passthrough to upstream device
 - `true`: Silently ignore write requests, return success response
 - `deny`: Reject write requests with Modbus illegal function exception
+
+Read-only mode applies only to the standard write function codes (`0x05`,
+`0x06`, `0x0F`, `0x10`). Other function codes, including vendor codes such as
+Huawei `0x41`, are forwarded as opaque PDUs. Those requests are not cached and
+are not retried.
 
 ## Docker Compose Examples
 

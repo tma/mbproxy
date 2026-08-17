@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -90,6 +91,7 @@ func (c *fakeRequestClient) WriteMultipleRegisters(ctx context.Context, _, _ uin
 }
 
 type fakeSession struct {
+	client      *fakeRequestClient
 	connectErr  error
 	connectHook func(context.Context)
 	beginHook   func(context.Context)
@@ -110,6 +112,12 @@ func (c *fakeSession) Close() error {
 	return nil
 }
 func (c *fakeSession) SetSlave(byte) {}
+func (c *fakeSession) SendRaw(ctx context.Context, _ []byte) ([]byte, error) {
+	if c.client == nil {
+		return nil, errors.New("unsupported function code")
+	}
+	return c.client.next(ctx)
+}
 func (c *fakeSession) BeginRequest(ctx context.Context, _ time.Duration) func() error {
 	if c.beginHook != nil {
 		c.beginHook(ctx)
@@ -134,6 +142,7 @@ func (s *fakeSessionSet) factory() (clientSession, requestClient) {
 		err = s.connectErrs[index]
 	}
 	return &fakeSession{
+		client:      s.client,
 		connectErr:  err,
 		connectHook: s.connectHook,
 		finishErr:   s.finishErr,
@@ -152,6 +161,14 @@ func newFakeClient(results []fakeResult) (*Client, *fakeSessionSet) {
 
 func readRequest() *Request {
 	return &Request{SlaveID: 1, FunctionCode: FuncReadHoldingRegisters, Address: 32000, Quantity: 1}
+}
+
+func vendorRequest() *Request {
+	return &Request{
+		SlaveID:      1,
+		FunctionCode: 0x41,
+		PDU:          []byte{0x41, 0x00, 0x01, 0x02},
+	}
 }
 
 func writeRequest() *Request {
@@ -867,6 +884,263 @@ func TestValidateRequest_AddressRangeBoundaries(t *testing.T) {
 			}
 			if DownstreamException(err) != tt.code {
 				t.Fatalf("expected exception 0x%02X, got error %v", tt.code, err)
+			}
+		})
+	}
+}
+
+func TestValidateRequest_VendorFunctionCode(t *testing.T) {
+	tests := []struct {
+		name string
+		req  *Request
+		code byte
+	}{
+		{
+			name: "huawei login pdu accepted",
+			req:  &Request{FunctionCode: 0x41, PDU: []byte{0x41, 0x00, 0x01, 0x02}},
+		},
+		{
+			name: "missing pdu rejected",
+			req:  &Request{FunctionCode: 0x41},
+			code: ExcIllegalFunction,
+		},
+		{
+			name: "mismatched pdu rejected",
+			req:  &Request{FunctionCode: 0x41, PDU: []byte{0x03, 0x00, 0x01}},
+			code: ExcIllegalFunction,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateRequest(tt.req)
+			if tt.code == 0 {
+				if err != nil {
+					t.Fatalf("expected valid vendor request, got %v", err)
+				}
+				return
+			}
+			if DownstreamException(err) != tt.code {
+				t.Fatalf("expected exception 0x%02X, got error %v", tt.code, err)
+			}
+		})
+	}
+}
+
+func TestClient_VendorFunctionReturnsRawPDU(t *testing.T) {
+	want := []byte{0x41, 0x00, 0xAA}
+	client, sessions := newFakeClient([]fakeResult{{data: want}})
+
+	resp, err := client.Execute(t.Context(), vendorRequest())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !bytes.Equal(resp, want) {
+		t.Fatalf("response = % x, want % x", resp, want)
+	}
+	if sessions.client.callCount() != 1 {
+		t.Fatalf("wire calls = %d, want 1", sessions.client.callCount())
+	}
+}
+
+func TestClient_VendorFunctionDoesNotRetryTransportFailure(t *testing.T) {
+	client, sessions := newFakeClient([]fakeResult{
+		{err: fakeTimeoutError{}},
+		{data: []byte{0x41, 0x00, 0xAA}},
+	})
+
+	_, err := client.Execute(t.Context(), vendorRequest())
+	if ErrorKindOf(err) != ErrorTransportTimeout {
+		t.Fatalf("expected transport timeout, got %v", err)
+	}
+	if sessions.client.callCount() != 1 || sessions.sessions.Load() != 1 {
+		t.Fatalf("vendor function retried, calls=%d sessions=%d", sessions.client.callCount(), sessions.sessions.Load())
+	}
+}
+
+func TestClient_LoopbackVendorFunction(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	wantPDU := []byte{0x41, 0x00, 0x01, 0x02}
+	wantResp := []byte{0x41, 0x00, 0xAA}
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		header := make([]byte, mbapHeaderSize)
+		if _, readErr := io.ReadFull(conn, header); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		pduLen := int(binary.BigEndian.Uint16(header[4:6])) - 1
+		pdu := make([]byte, pduLen)
+		if _, readErr := io.ReadFull(conn, pdu); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		if !bytes.Equal(pdu, wantPDU) {
+			serverErr <- fmt.Errorf("upstream pdu = % x, want % x", pdu, wantPDU)
+			return
+		}
+		response := make([]byte, mbapHeaderSize+len(wantResp))
+		copy(response[:2], header[:2])
+		binary.BigEndian.PutUint16(response[4:6], uint16(len(wantResp)+1))
+		response[6] = header[6]
+		copy(response[7:], wantResp)
+		_, writeErr := conn.Write(response)
+		serverErr <- writeErr
+	}()
+
+	client := NewClient(listener.Addr().String(), time.Second, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	})
+	resp, err := client.Execute(t.Context(), vendorRequest())
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !bytes.Equal(resp, wantResp) {
+		t.Fatalf("response = % x, want % x", resp, wantResp)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("loopback server: %v", err)
+	}
+}
+
+func TestClient_LoopbackVendorException(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		request := make([]byte, 11)
+		if _, readErr := io.ReadFull(conn, request); readErr != nil {
+			serverErr <- readErr
+			return
+		}
+		response := make([]byte, 9)
+		copy(response[:2], request[:2])
+		binary.BigEndian.PutUint16(response[4:6], 3)
+		response[6] = request[6]
+		response[7] = request[7] | 0x80
+		response[8] = ExcIllegalValue
+		_, writeErr := conn.Write(response)
+		serverErr <- writeErr
+	}()
+
+	client := NewClient(listener.Addr().String(), time.Second, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close client: %v", err)
+		}
+	})
+	_, err = client.Execute(t.Context(), vendorRequest())
+	if ErrorKindOf(err) != ErrorProtocolException {
+		t.Fatalf("expected protocol exception, got %v", err)
+	}
+	if DownstreamException(err) != ExcIllegalValue {
+		t.Fatalf("expected preserved exception, got 0x%02X", DownstreamException(err))
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("loopback server: %v", err)
+	}
+}
+
+func TestClient_LoopbackVendorMalformedResponsesMapGatewayWithoutRetry(t *testing.T) {
+	tests := []struct {
+		name          string
+		buildResponse func([]byte) []byte
+	}{
+		{
+			name: "wrong normal function code",
+			buildResponse: func(request []byte) []byte {
+				response := make([]byte, 11)
+				copy(response[:2], request[:2])
+				binary.BigEndian.PutUint16(response[4:6], 5)
+				response[6] = request[6]
+				response[7] = FuncReadHoldingRegisters
+				response[8] = 2
+				response[9] = 0x12
+				response[10] = 0x34
+				return response
+			},
+		},
+		{
+			name: "exception missing code",
+			buildResponse: func(request []byte) []byte {
+				response := make([]byte, 8)
+				copy(response[:2], request[:2])
+				binary.BigEndian.PutUint16(response[4:6], 2)
+				response[6] = request[6]
+				response[7] = request[7] | 0x80
+				return response
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer listener.Close()
+
+			var accepts atomic.Int32
+			serverErr := make(chan error, 1)
+			go func() {
+				conn, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					serverErr <- acceptErr
+					return
+				}
+				accepts.Add(1)
+				defer conn.Close()
+				request := make([]byte, 11)
+				if _, readErr := io.ReadFull(conn, request); readErr != nil {
+					serverErr <- readErr
+					return
+				}
+				_, writeErr := conn.Write(tt.buildResponse(request))
+				serverErr <- writeErr
+			}()
+
+			client := NewClient(listener.Addr().String(), time.Second, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			t.Cleanup(func() {
+				if err := client.Close(); err != nil {
+					t.Errorf("close client: %v", err)
+				}
+			})
+			_, err = client.Execute(t.Context(), vendorRequest())
+			if ErrorKindOf(err) != ErrorTransportClosed {
+				t.Fatalf("expected transport closed, got %v", err)
+			}
+			if DownstreamException(err) != ExcGatewayTargetFailed {
+				t.Fatalf("expected gateway exception, got 0x%02X", DownstreamException(err))
+			}
+			if accepts.Load() != 1 {
+				t.Fatalf("vendor malformed response retried, accepts=%d", accepts.Load())
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatalf("loopback server: %v", err)
 			}
 		})
 	}

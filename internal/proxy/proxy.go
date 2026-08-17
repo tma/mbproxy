@@ -159,7 +159,15 @@ func (p *Proxy) HandleRequest(ctx context.Context, req *modbus.Request) ([]byte,
 		return p.handleRead(ctx, req)
 	}
 
-	return nil, fmt.Errorf("validated unsupported function code: 0x%02X", req.FunctionCode)
+	return p.handlePassthrough(ctx, req)
+}
+
+func (p *Proxy) handlePassthrough(ctx context.Context, req *modbus.Request) ([]byte, error) {
+	p.logger.Debug("forwarding function code",
+		"slave_id", req.SlaveID,
+		"func", fmt.Sprintf("0x%02X", req.FunctionCode),
+	)
+	return p.client.Execute(ctx, req)
 }
 
 func (p *Proxy) handleRead(ctx context.Context, req *modbus.Request) ([]byte, error) {

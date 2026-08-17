@@ -29,6 +29,7 @@ type clientSession interface {
 	Close() error
 	SetSlave(byte)
 	BeginRequest(context.Context, time.Duration) func() error
+	SendRaw(context.Context, []byte) ([]byte, error)
 }
 
 type sessionFactory func() (clientSession, requestClient)
@@ -182,6 +183,47 @@ func (c *tcpSession) Close() error {
 
 func (c *tcpSession) SetSlave(slaveID byte) {
 	c.handler.SetSlave(slaveID)
+}
+
+func (c *tcpSession) SendRaw(ctx context.Context, pdu []byte) ([]byte, error) {
+	if len(pdu) < 1 {
+		return nil, fmt.Errorf("empty pdu")
+	}
+
+	request := &gridmodbus.ProtocolDataUnit{
+		FunctionCode: pdu[0],
+		Data:         append([]byte(nil), pdu[1:]...),
+	}
+	aduRequest, err := c.handler.Encode(request)
+	if err != nil {
+		return nil, err
+	}
+	aduResponse, err := c.handler.Send(ctx, aduRequest)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.handler.Verify(aduRequest, aduResponse); err != nil {
+		return nil, err
+	}
+	response, err := c.handler.Decode(aduResponse)
+	if err != nil {
+		return nil, err
+	}
+	if response.FunctionCode != request.FunctionCode {
+		exceptionCode := byte(0)
+		if len(response.Data) > 0 {
+			exceptionCode = response.Data[0]
+		}
+		return nil, &gridmodbus.Error{
+			FunctionCode:  response.FunctionCode,
+			ExceptionCode: exceptionCode,
+		}
+	}
+
+	out := make([]byte, 1+len(response.Data))
+	out[0] = response.FunctionCode
+	copy(out[1:], response.Data)
+	return out, nil
 }
 
 func (c *tcpSession) BeginRequest(ctx context.Context, attemptTimeout time.Duration) func() error {
@@ -821,7 +863,13 @@ func ValidateRequest(req *Request) error {
 			return newValidationError(ExcIllegalValue, "write data has %d bytes, expected %d", len(req.Data), expected)
 		}
 	default:
-		return newValidationError(ExcIllegalFunction, "unsupported function code: 0x%02X", req.FunctionCode)
+		if len(req.PDU) < 1 {
+			return newValidationError(ExcIllegalFunction, "missing pdu for function code: 0x%02X", req.FunctionCode)
+		}
+		if req.PDU[0] != req.FunctionCode {
+			return newValidationError(ExcIllegalFunction, "pdu function code 0x%02X does not match request 0x%02X", req.PDU[0], req.FunctionCode)
+		}
+		return nil
 	}
 	if uint32(req.Address)+uint32(req.Quantity) > 65536 {
 		return newValidationError(ExcIllegalAddress, "address range exceeds 0xFFFF")
@@ -882,7 +930,7 @@ func (c *Client) executeRequest(ctx context.Context, req *Request) ([]byte, erro
 		}
 		return c.buildWriteResponse(req.FunctionCode, req.Address, results), nil
 	default:
-		return nil, fmt.Errorf("unsupported function code: 0x%02X", req.FunctionCode)
+		return c.session.SendRaw(ctx, req.PDU)
 	}
 }
 
